@@ -1,0 +1,47 @@
+paths:
+  data_train:    "/workspace/retina_Ai/data/DDR-dataset/train/train.csv"
+  data_val:      "/workspace/retina_Ai/data/DDR-dataset/eval/images"
+  bad_files_txt: null
+  checkpoint_dir: "/workspace/retina_Ai/checkpoints_512v4"
+  pretrained_256: "/workspace/retina_Ai/checkpoints_256/last.pt"
+  ddr_images_dir: "/workspace/retina_Ai/data/DDR-dataset/eval/images"
+  ddr_masks_dir:  "/workspace/retina_Ai/data/DDR-dataset/eval/masks"
+  retfound_weights: "/workspace/retina_Ai/RETFound_cfp_weights.pth"
+
+sweep:
+  enabled:    false
+  csv:        "/workspace/retina_Ai/data/DDR-dataset/eval/sweep_visual_20.csv"
+  out_dir:    "/workspace/sweep_results"
+  t_starts:   [200, 250, 300, 350]
+  ddim_steps: [50]
+  lcw_values: [0.4]
+
+training:
+  crop_size:        512
+  epochs:           20
+  batch_size:       6
+  accum_steps:      6
+  warmup_epochs:    3
+  num_workers_train: 4
+  num_workers_val:   0
+  prefetch_factor:   2
+
+  lr_unet:       5.0e-6
+  lr_conditioner: 1.0e-5
+  snr_gamma:      2.0
+
+diffusion:
+  simplex_freq:    8
+  simplex_octaves: 4
+  ddim_steps:      50
+  ddim_t_start:    300
+  max_train_lcw:   0.4
+
+eval:
+  vis_every:       1
+  eval_every:      10
+  num_vis:         1
+  ddr_eval_every:  10
+  ddr_max_images:  ~
+  ddr_max_seconds: ~
+  lcw_plot_every:  50

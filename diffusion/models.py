@@ -62,8 +62,11 @@ class RETFoundConditioner(nn.Module):
 
     @torch.no_grad()
     def extract_features(self, x):
+        # Force NCHW FIRST, before any op touches the tensor
+        x = x.to(memory_format=torch.contiguous_format).float()
+        
         # 1. Interpolate to RETFound's expected 224x224
-        x_r = F.interpolate(x.float(), size=(224,224), mode='bicubic', align_corners=False)
+        x_r = F.interpolate(x, size=(224,224), mode='bicubic', align_corners=False)
         
         # 2. Revert from [-1, 1] (Diffusion space) back to [0, 1] (Standard RGB space)
         x_01 = (x_r + 1.0) / 2.0 
@@ -145,7 +148,7 @@ class CachedConditioner:
     def get_tile_conds_batched(self, img_512, tile_views):
         """Batch all 9 tile ViT passes into a single forward pass."""
         assert img_512.shape[0] == 1, "tile-cond batching assumes B=1"
-        tiles = torch.stack([img_512[0, :, h0:h1, w0:w1]
+        tiles = torch.stack([img_512[0, :, h0:h1, w0:w1].contiguous()
                              for (h0, h1, w0, w1) in tile_views])
         with torch.no_grad():
             feats = self.conditioner.extract_features(tiles)

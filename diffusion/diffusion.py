@@ -55,12 +55,26 @@ FULL_SIZE = 512
 TILE_STRIDE = 128
 NUM_TRAIN_TILES = 2 
 
-def get_tile_views(H, W,tile_size=TILE_SIZE, stride=TILE_STRIDE):
+def get_tile_views(H, W, tile_size=TILE_SIZE, stride=TILE_STRIDE):
+    """
+    Generate tile (h0,h1,w0,w1) views that fully cover [0,H]x[0,W].
+    Guarantees the last tile in each axis is flush with the image edge.
+    """
     views = []
-    for h_start in range(0, H - tile_size + 1,stride):
-        for w_start in range(0, W - tile_size + 1,stride):
-            views.append((h_start,h_start+tile_size,
-            w_start,w_start+tile_size))
+    h_starts = list(range(0, H - tile_size, stride))
+    if not h_starts or h_starts[-1] + tile_size < H:
+        h_starts.append(H - tile_size)          # flush-right tile
+    w_starts = list(range(0, W - tile_size, stride))
+    if not w_starts or w_starts[-1] + tile_size < W:
+        w_starts.append(W - tile_size)
+
+    seen = set()
+    for h0 in h_starts:
+        for w0 in w_starts:
+            key = (h0, w0)
+            if key not in seen:
+                seen.add(key)
+                views.append((h0, h0 + tile_size, w0, w0 + tile_size))
     return views
 
 TILE_VIEWS = get_tile_views(FULL_SIZE, FULL_SIZE, TILE_SIZE, TILE_STRIDE)
@@ -68,11 +82,12 @@ TILE_VIEWS = get_tile_views(FULL_SIZE, FULL_SIZE, TILE_SIZE, TILE_STRIDE)
 
 def make_linear_weight(tile_size=TILE_SIZE, device='cpu'):
     """
-    Creates a 2D pyramid weight that peaks at 1.0 in the center and hits 0 at
-    the edges. Perfect for 50% overlap tiling.
+    Pyramid weight that peaks at 1.0 in the center.
+    Edge minimum is raised to 0.1 so boundary pixels are never starved,
+    eliminating the top/bottom black-cut artifact.
     """
     coords = torch.linspace(-1, 1, tile_size, device=device)
-    w_1d = (1.0 - torch.abs(coords)).clamp(min=1e-3)
+    w_1d   = (1.0 - torch.abs(coords)) + 1e-4   # smooth falloff without sharp seams, prevents starvation
     yy, xx = torch.meshgrid(w_1d, w_1d, indexing='ij')
     w = yy * xx
     return w.unsqueeze(0).unsqueeze(0)
@@ -89,10 +104,9 @@ def get_linear_weight(tile_size=TILE_SIZE, device='cpu'):
 # 3. RETINAL MASK
 # -----------------------------------------------------------------------------
 
-def make_retinal_mask(images, margin=0.0):
+def make_retinal_mask(images):
     """
-    Dynamic Elliptical Retinal Mask
-    Auto-fits to the actual bounds of the illuminated fundus FOV.
+    Intensity-based Retinal Mask (Foreground only, no artificial circular cropping)
     """
     B, C, H, W = images.shape
     device = images.device
@@ -101,52 +115,10 @@ def make_retinal_mask(images, margin=0.0):
     img_01 = (images.float() + 1.0) / 2.0
     
     # 2. Pixel-by-pixel intensity check (The Foreground)
+    # This automatically matches the natural shape of the retina.
     fg = 1.0 - (img_01.mean(dim=1, keepdim=True) < 0.05).float()
     
-    # 3. Dynamic Auto-fitting Ellipse
-    masks = []
-    for i in range(B):
-        single_fg = fg[i, 0] # Grab the 2D mask for this specific image in the batch
-        
-        # Find the coordinates of all illuminated pixels
-        non_zero_indices = torch.nonzero(single_fg)
-        
-        # Fallback if image is completely black (corrupted)
-        if non_zero_indices.numel() == 0:
-            masks.append(torch.zeros_like(single_fg))
-            continue
-            
-        # Find the exact geographic bounds of the retina
-        min_y, min_x = torch.min(non_zero_indices, dim=0)[0]
-        max_y, max_x = torch.max(non_zero_indices, dim=0)[0]
-        
-        # Calculate the exact center
-        cy = (max_y + min_y) / 2.0
-        cx = (max_x + min_x) / 2.0
-        
-        # Calculate the independent horizontal (rx) and vertical (ry) radii,
-        # and shrink them by your 5% safety margin to avoid edge artifacts.
-        ry = ((max_y - min_y) / 2.0) * (1.0 - margin)
-        rx = ((max_x - min_x) / 2.0) * (1.0 - margin)
-        
-        # Prevent division-by-zero crashes on extremely weird images
-        ry = max(ry, 1.0)
-        rx = max(rx, 1.0)
-        
-        # Generate the coordinate grid
-        ys = torch.arange(H, device=device).float() - cy
-        xs = torch.arange(W, device=device).float() - cx
-        yy, xx = torch.meshgrid(ys, xs, indexing='ij')
-        
-        # The Ellipse Equation: (x^2 / a^2) + (y^2 / b^2) <= 1
-        ellipse = ((yy**2 / ry**2) + (xx**2 / rx**2)) <= 1.0
-        masks.append(ellipse.float())
-        
-    # Stack the batch back together
-    ellipse_mask = torch.stack(masks).unsqueeze(1)
-    
-    # Intersection: Must be illuminated AND inside the safety ellipse
-    return ellipse_mask * fg
+    return fg
 
 # -----------------------------------------------------------------------------
 # 4. MULTIDIFFUSION DDIM INFERENCE

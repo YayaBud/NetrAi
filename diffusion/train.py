@@ -1,3 +1,5 @@
+import torch
+
 import os
 import csv
 import math
@@ -87,8 +89,8 @@ def main(config_path="config.yaml"):
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF",
                           "expandable_segments:True,max_split_size_mb:256")
     torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32       = True
-    torch.backends.cudnn.benchmark        = True
+    # torch.backends.cudnn.allow_tf32       = True
+    # torch.backends.cudnn.benchmark        = True
 
     device      = "cuda" if torch.cuda.is_available() else "cpu"
     device_type = "cuda" if device == "cuda" else "cpu"
@@ -133,7 +135,6 @@ def main(config_path="config.yaml"):
                         "CrossAttnUpBlock2D","UpBlock2D"),
         cross_attention_dim=768,
     ).to(device)
-    model = model.to(memory_format=torch.channels_last)  # O2: NHWC for faster convs
     model.enable_gradient_checkpointing()
 
     if device == "cuda":
@@ -176,12 +177,12 @@ def main(config_path="config.yaml"):
     torch._dynamo.config.cache_size_limit = 64
 
     USE_COMPILE = False
-    try:
-        model = torch.compile(model, mode="default")
-        USE_COMPILE = True
-        print("torch.compile enabled (default mode)")
-    except Exception as e:
-        print(f"torch.compile skipped: {e}")
+    # try:
+    #     model = torch.compile(model, mode="default")
+    #     USE_COMPILE = True
+    #     print("torch.compile enabled (default mode)")
+    # except Exception as e:
+    #     print(f"torch.compile skipped: {e}")
 
     # fix: xformers + compile = attention processor identity thrash → cache misses.
     # Only enable xformers when compile is NOT active.
@@ -381,8 +382,7 @@ def main(config_path="config.yaml"):
         pbar = tqdm(train_loader, desc=f"Epoch {epoch:3d}/{EPOCHS} [v4]")
 
         for step, (batch, paths) in enumerate(pbar):
-            batch = batch.to(device, non_blocking=True,
-                            memory_format=torch.channels_last)  # O2
+            batch = batch.to(device, non_blocking=True)
             B     = batch.shape[0]
 
             sampled_views = random.sample(TILE_VIEWS, min(NUM_TRAIN_TILES, len(TILE_VIEWS)))
@@ -503,14 +503,13 @@ def main(config_path="config.yaml"):
 
         with torch.inference_mode():
             for batch_v, paths_v in val_loader:
-                batch_v = batch_v.to(device, non_blocking=True,
-                                     memory_format=torch.channels_last)  # O2
+                batch_v = batch_v.to(device, non_blocking=True)
                 B_v     = batch_v.shape[0]
                 step_loss = torch.tensor(0.0, device=device)
                 for bi in range(B_v):
                     # fix #9: hoist cond outside tile loop
                     cond_v = cached_cond.get_full_image_cond(batch_v[bi:bi+1], paths_v[bi])
-                    val_views = random.sample(TILE_VIEWS, min(4, len(TILE_VIEWS)))
+                    val_views = random.sample(TILE_VIEWS, min(2, len(TILE_VIEWS)))
                     n_val_tiles = len(val_views)
                     for (h0, h1, w0, w1) in val_views:
                         tile = batch_v[bi:bi+1, :, h0:h1, w0:w1]

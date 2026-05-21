@@ -1,0 +1,35 @@
+# NetrAi Classifier — Python Dependencies
+# =========================================
+# Install with:  pip install -r classifier/requirements.txt
+
+# ── Core Deep Learning ────────────────────────────────────────────────────
+torch>=2.1.0
+torchvision>=0.16.0
+
+# ── HuggingFace (SegFormer MIT-B3 + ViT-L/16 fallback) ───────────────────
+transformers>=4.37.0
+
+# ── RETFound backbone loader (timm ViT-Large) ─────────────────────────────
+timm>=0.9.12
+
+# ── XGBoost ───────────────────────────────────────────────────────────────
+xgboost>=2.0.3
+
+# ── Classical ML / Metrics ────────────────────────────────────────────────
+scikit-learn>=1.3.0
+scipy>=1.11.0              # used by diffusion evaluation (Frangi filter)
+
+# ── Data / Numerics ───────────────────────────────────────────────────────
+numpy>=1.24.0
+Pillow>=9.5.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────
+tqdm>=4.65.0
+pyyaml>=6.0
+
+# ── Explainability (optional but recommended for clinical use) ─────────────
+shap>=0.44.0               # run: pip install shap
+
+# ── Visualisation (optional, for debugging feature distributions) ──────────
+matplotlib>=3.7.0
+seaborn>=0.12.0

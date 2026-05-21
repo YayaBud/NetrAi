@@ -22,7 +22,7 @@ training:
   batch_size:       6
   accum_steps:      6
   warmup_epochs:    3
-  num_workers_train: 4
+  num_workers_train: 0
   num_workers_val:   0
   prefetch_factor:   2
 

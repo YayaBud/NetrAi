@@ -8,20 +8,24 @@ from torchvision import transforms
 
 def make_transform(crop_size, is_train):
     # Swapped to BILINEAR to prevent bicubic ringing artifacts in the L1 residual
-    base = [transforms.Resize((crop_size+64, crop_size+64),
-                               interpolation=transforms.InterpolationMode.BILINEAR)]
     if is_train:
+        base = [transforms.Resize((crop_size+64, crop_size+64),
+                                   interpolation=transforms.InterpolationMode.BILINEAR)]
         aug = [
             transforms.RandomResizedCrop(crop_size, scale=(0.8,1.0), ratio=(0.9,1.1),
                                           interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomVerticalFlip(p=0.5), # Bumped to 0.5 because 256px tiles are orientation-agnostic
-            transforms.RandomRotation(degrees=15, interpolation=transforms.InterpolationMode.BILINEAR), # Added to handle vessel angles
+            transforms.RandomVerticalFlip(p=0.5),
             transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1, hue=0.02),
         ]
     else:
-        aug = [transforms.CenterCrop(crop_size)]
-        
+        # Prevent cutting off the top and bottom of the retinal mask during validation
+        # We resize directly to the full square size to ensure full spatial coverage,
+        # removing the zoom-in/center-crop behavior.
+        base = [transforms.Resize((crop_size, crop_size),
+                                   interpolation=transforms.InterpolationMode.BILINEAR)]
+        aug = []
+
     return transforms.Compose(base + aug + [
         transforms.ToTensor(),
         transforms.Normalize([0.5]*3, [0.5]*3), # Verify RETFound is okay with this!

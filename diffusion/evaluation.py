@@ -173,10 +173,9 @@ def compute_ddr_metrics(model, cached_cond, ddim_scheduler,
     print(f"  DDR eval budget: {ddr_step_count} DDIM steps/image | "
           f"max runtime: {budget_msg}", flush=True)
 
-    to_tensor  = transforms.ToTensor()
-    resize_512 = transforms.Resize((512, 512),
-                                    interpolation=transforms.InterpolationMode.BICUBIC)
-    normalize  = transforms.Normalize([0.5]*3, [0.5]*3)
+    to_tensor   = transforms.ToTensor()
+    resize_512  = transforms.Resize((512, 512), interpolation=transforms.InterpolationMode.BILINEAR)
+    normalize   = transforms.Normalize([0.5]*3, [0.5]*3)
     all_preds, all_gts = [], []
 
     start_time = time.time()

@@ -1,25 +1,29 @@
 # =============================================================================
-# NetrAi Classifier — Master Configuration
+# NetrAi Classifier — Master Configuration (v2)
 # =============================================================================
-# Classes: 0=DR, 1=Glaucoma, 2=PM (Pathologic Myopia)
+# Architecture: Dual-stream with expert heads + dual VIB + 3 binary XGBoosts
+# Classes: DR=0, Glaucoma=1, PM=2  (multi-label — NOT mutually exclusive)
 
 paths:
-  # Root directory containing class-organised image folders
+  # Root directory containing class-organised image folders (train/ val/)
   data_dir:           "data/classifier"
-  # Directory of per-image clean residual anomaly maps from the diffusion model
-  # Each map must be named  <image_stem>_anomaly.png  (greyscale or hot-cmap PNG)
+  # Directory of clean residual anomaly maps from the diffusion model
+  # Each map named  <image_stem>_anomaly.png  (greyscale or colormap PNG)
   anomaly_maps_dir:   "data/anomaly_maps"
   # Output directories
   checkpoint_dir:     "checkpoints/classifier"
   features_dir:       "features"
+  # Pre-computed RETFound .pt embedding cache (one file per image)
+  # Files named: <split>_<class>_<stem>.pt  e.g. train_DR_image_001.pt
   retfound_cache_dir: "retfound_cache"
   # Path to local RETFound-cfp weights (.pth checkpoint)
-  # Leave null to fall back to ViT-L/16 ImageNet weights (not recommended)
+  # Leave null to fall back to HuggingFace ViT-L/16 (not recommended)
   retfound_weights:   null
 
 data:
   image_size: 512
-  # ImageNet normalisation (matches MIT-B3 pretraining AND RETFound)
+  # ImageNet normalisation — applied to RGB channels only
+  # Clean residual channels are kept in [0, 1] (no normalisation)
   mean: [0.485, 0.456, 0.406]
   std:  [0.229, 0.224, 0.225]
   num_workers: 4
@@ -27,72 +31,70 @@ data:
 
 model:
   backbone: "nvidia/mit-b3"
-  # Channel count each encoder stage projects to in the decode head
-  decoder_embed_dim: 256          # 4 × 256 = 1024 → F_concat channels
-  # Dual-path output dimensions
-  path_a_dim: 384
-  path_b_dim: 384                 # equals mu dimension
-  # Learned gate scalar α initialisation
-  alpha_init: 1.0
-  # Final vector: 384 + 384 + 1 = 769
-  # XGBoost input:  769 + 1024   = 1793
+
+  # Expert head output dimension (DR, Glauc, PM heads each output this)
+  head_out_dim: 256           # 3 × 256 = 768 → VIB1 input
+
+  # VIB internal hidden dimension (pre-μ/logσ projection)
+  vib_hidden: 256
+
+  # VIB output dimension (z1 and z2 each produce this)
+  vib_out_dim: 128            # z_fused = 128 + 128 = 256-D → XGBoost
+
+  # Dropout rate in expert head FC layers
+  dropout: 0.3
+
+  # Final feature vector for XGBoost: 256-D
+  # (128-D VIB1 from custom heads ⊕ 128-D VIB2 from RETFound)
 
 training:
-  epochs: 100
-  batch_size: 16
-  lr: 1.0e-4
+  epochs: 60
+  batch_size: 8               # RETFound+MIT-B3 are large; 8 is safe on 20GB VRAM
+  lr: 1.0e-4                  # Head/VIB LR — backbone gets lr × 0.1 = 1e-5
   weight_decay: 1.0e-4
   warmup_epochs: 5
   grad_clip: 1.0
-  amp: true                       # mixed-precision (bfloat16 on Ampere+)
+  amp: true                   # mixed-precision (bfloat16 on Ampere+, float16 otherwise)
 
-  # ---------- Loss weights ----------
-  supcon_weight: 1.0
-  lambda_kl:     1.0              # pass-through — β (via BetaScheduler) is the sole VIB knob
-  lambda_ortho:  0.1
+  # ---- Loss weights ----
+  lambda_aux: 0.4             # L_aux weight — forces VIB1 to encode disease signal
+  lambda_kl:  1.0             # KL penalty pass-through (β is the main VIB knob)
 
-  # ---------- SupCon temperatures (per class) ----------
-  # Lower = sharper gradient = more attention on hard negatives
-  supcon_temperatures:
-    0: 0.07   # DR
-    1: 0.07   # Glaucoma
-    2: 0.04   # PM (minority → sharper penalty)
-  supcon_base_temperature: 0.07
+  # ---- VIB β-annealing ----
+  # β = 0 during warmup (classifiers establish clusters first)
+  # β linearly ramps 0 → beta_target during anneal phase
+  # β = beta_target from then on
+  beta_warmup_epochs:  10     # β = 0 for first N epochs
+  beta_anneal_epochs:  20     # linear ramp from epoch 10 → 30
+  beta_target:         0.001  # final β value
 
-  # ---------- VIB β-annealing ----------
-  beta_warmup_epochs:  10         # β = 0 for first N epochs
-  beta_anneal_epochs:  20         # linear ramp after warmup
-  beta_target:         0.001      # final β value
-
-  # ---------- Checkpointing ----------
-  save_every: 5                   # save checkpoint every N epochs
-  eval_every: 1
+  # ---- Checkpointing ----
+  save_every: 5               # save checkpoint every N epochs
+  eval_every: 1               # validate every N epochs
 
 retfound:
   embed_dim: 1024
-  image_size: 224                 # RETFound expects 224×224
-  # How many images to process per GPU batch during pre-computation
-  cache_batch_size: 32
+  image_size: 224             # RETFound expects 224×224
+  cache_batch_size: 32        # images per GPU batch during pre-computation
 
 xgboost:
-  # Feature vector: 1793-D  (769 SegFormer + 1024 RETFound)
-  n_estimators:        1000
-  max_depth:           6
-  learning_rate:       0.05
-  subsample:           0.8
-  colsample_bytree:    0.8
-  min_child_weight:    3
-  gamma:               0.1
-  reg_alpha:           0.1        # L1
-  reg_lambda:          1.0        # L2
-  objective:           "multi:softprob"
-  num_class:           3
-  eval_metric:         "mlogloss"
+  # Three independent binary classifiers on 256-D vectors.
+  # Each uses objective: binary:logistic and eval_metric: auc.
+  # Models saved separately: xgboost/xgb_DR.pkl, xgb_Glaucoma.pkl, xgb_PM.pkl
+  n_estimators:          500
+  max_depth:             6
+  learning_rate:         0.05
+  subsample:             0.8
+  colsample_bytree:      0.8
+  min_child_weight:      3
+  gamma:                 0.1
+  reg_alpha:             0.1  # L1
+  reg_lambda:            1.0  # L2
   early_stopping_rounds: 50
-  seed:                42
-  device:              "cuda"     # or "cpu"
-  tree_method:         "hist"     # required for reliable GPU tree building
-  n_jobs:              -1
+  seed:                  42
+  device:                "cuda"
+  tree_method:           "hist"   # required for GPU tree building
+  n_jobs:                -1
 
 classes:
   names: ["DR", "Glaucoma", "PM"]

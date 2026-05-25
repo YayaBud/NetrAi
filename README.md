@@ -1,45 +1,51 @@
-# NetrAI — Retinal Anomaly Detection via Diffusion-Based Reconstruction
+# NetrAI — Retinal Intelligence System
 
-> A diffusion model system for unsupervised retinal lesion detection using SDEdit-style reconstruction error as an anomaly score. Conditions on frozen RETFound (ViT-Large) embeddings and performs inference via MultiDiffusion tiling over full 512px fundus images.
+> A two-stage retinal analysis system: a **diffusion model** for unsupervised lesion detection, feeding into a **dual-stream classifier** for disease identification (DR / Glaucoma / PM).
+>
+> Stage 1 (Diffusion) answers *where* — generating anomaly maps via SDEdit reconstruction error.  
+> Stage 2 (Classifier) answers *what* — classifying disease from those maps + RETFound domain embeddings.
 
 ---
 
 ## Table of Contents
 
-- [Overview](#overview)
-- [Training Dataset](#training-dataset)
-- [Architecture](#architecture)
-- [Project Structure](#project-structure)
-- [Module Reference — Diffusion](#module-reference--diffusion)
-  - [train.py](#trainpy)
-  - [models.py](#modelspy)
-  - [diffusion.py](#diffusionpy)
-  - [data.py](#datapy)
-  - [losses.py](#lossespy)
-  - [evaluation.py](#evaluationpy)
-  - [visualization.py](#visualizationpy)
-  - [sweep.py](#sweeppy)
-  - [utils.py](#utilspy)
-  - [config.yaml](#configyaml)
-- [Key Design Decisions — Diffusion](#key-design-decisions--diffusion)
-- [Training Pipeline](#training-pipeline)
-- [Inference Pipeline](#inference-pipeline)
-- [Evaluation](#evaluation)
-- [Checkpoints](#checkpoints)
-- [Requirements](#requirements)
-- [Usage — Diffusion](#usage--diffusion)
-- [Classifier Pipeline](#classifier-pipeline)
-  - [Classifier Architecture](#classifier-architecture)
-  - [Classifier Project Structure](#classifier-project-structure)
-  - [Classifier Setup](#classifier-setup)
-  - [Classifier Training Pipeline](#classifier-training-pipeline)
-  - [Classifier Configuration Reference](#classifier-configuration-reference)
-  - [Running Tests](#running-tests)
-  - [Key Design Decisions — Classifier](#key-design-decisions--classifier)
+**Diffusion Model**
+1. [Overview](#1-overview)
+2. [Training Dataset](#2-training-dataset)
+3. [Diffusion Architecture](#3-diffusion-architecture)
+4. [Module Reference — Diffusion](#4-module-reference--diffusion)
+5. [Key Design Decisions — Diffusion](#5-key-design-decisions--diffusion)
+6. [Diffusion Training Pipeline](#6-diffusion-training-pipeline)
+7. [Diffusion Inference Pipeline](#7-diffusion-inference-pipeline)
+8. [Evaluation](#8-evaluation)
+9. [Checkpoints](#9-checkpoints)
+10. [Requirements](#10-requirements)
+11. [Usage — Diffusion](#11-usage--diffusion)
+
+**Classifier Pipeline**
+
+12. [Classifier Overview](#12-classifier-overview)
+13. [Classifier Architecture — Full Breakdown](#13-classifier-architecture--full-breakdown)
+14. [Loss Function Deep Dive](#14-loss-function-deep-dive)
+15. [Two-Phase Training Strategy](#15-two-phase-training-strategy)
+16. [Why These Architectural Choices](#16-why-these-architectural-choices)
+17. [Classifier Project Structure](#17-classifier-project-structure)
+18. [Data Layout](#18-data-layout)
+19. [Classifier Setup](#19-classifier-setup)
+20. [Classifier Pipeline — Step by Step](#20-classifier-pipeline--step-by-step)
+21. [Classifier Configuration Reference](#21-classifier-configuration-reference)
+22. [Inference](#22-inference)
+23. [Key Hyperparameter Decisions](#23-key-hyperparameter-decisions)
+24. [Feature Dimensions Reference](#24-feature-dimensions-reference)
+25. [Running Tests](#25-running-tests)
 
 ---
 
-## Overview
+# Part I — Diffusion Model
+
+---
+
+## 1. Overview
 
 NetrAI frames retinal anomaly detection as a **reconstruction problem**. A DDPM/DDIM diffusion UNet is trained exclusively on healthy retinal images. At inference, a test image is partially noised (SDEdit, `T_start < 1000`) and reconstructed. The residual between the original and reconstruction is the anomaly map — lesions the model never saw during training produce high residual signal.
 
@@ -47,12 +53,12 @@ The primary evaluation metric is **pixel-level AUROC on the DDR and iDRiD datase
 
 ---
 
-## Training Dataset
+## 2. Training Dataset
 
-The model is trained exclusively on **22,104 healthy fundus images** drawn from 6 public sources:
+The model is trained exclusively on **22,104 healthy fundus images** from 6 public sources:
 
 | Source | Count | % of Total |
-|---|---|---|
+|--------|-------|-----------|
 | EyePACS | 13,500 | 61.1% |
 | DDR | 5,241 | 23.7% |
 | APTOS | 1,625 | 7.4% |
@@ -61,11 +67,11 @@ The model is trained exclusively on **22,104 healthy fundus images** drawn from 
 | STARE | 28 | 0.1% |
 | **Total** | **22,104** | **100%** |
 
-Only grade-0 (no diabetic retinopathy) images are used from graded datasets (EyePACS, DDR, APTOS, MESSIDOR-2). The model never sees lesion-bearing images during training — anomaly detection at inference relies entirely on reconstruction error against this healthy prior.
+Only grade-0 (no diabetic retinopathy) images are used from graded datasets. The model never sees lesion-bearing images during training — anomaly detection at inference relies entirely on reconstruction error against this healthy prior.
 
 ---
 
-## Architecture
+## 3. Diffusion Architecture
 
 ```
 Input (512×512 fundus image)
@@ -99,45 +105,14 @@ Residual Map ──► Retinal Ellipse Mask ──► Frangi Vessel Suppression
         |
         ▼
 Anomaly Score (pixel-level, used for DDR AUROC)
+        |
+        ▼
+     [Feed to Classifier — Part II]
 ```
 
 ---
 
-## Project Structure
-
-```
-NetrAI/
-├── config.yaml           # All hyperparameters and paths (single source of truth)
-│
-├── train.py              # Main training loop, model setup, checkpoint I/O
-├── models.py             # RETFoundConditioner, CachedConditioner
-├── diffusion.py          # Noise schedule, DDIM steps, MultiDiffusion tiling, residual
-├── data.py               # RetinaDataset (CSV/TXT/dir), transforms, collate_fn
-├── losses.py             # SNR-weighted loss, L1+Focal Frequency hybrid loss
-├── evaluation.py         # DDR AUROC/AP/Dice, SSIM/PSNR, vessel-aware post-processing
-├── visualization.py      # Reconstruction panels, anomaly map overlays, metrics dashboard
-├── sweep.py              # Hyperparameter sweep: T_start × DDIM_STEPS × LCW grid
-└── utils.py              # CSV helpers, checkpoint utilities, terminal logging, LCW curve
-
-classifier/               # Disease classification pipeline (see Classifier section)
-├── config.yaml
-├── model.py
-├── losses.py
-├── data.py
-├── retfound.py
-├── train.py
-├── extract.py
-├── xgboost_clf.py
-├── inference.py
-├── utils.py
-├── __init__.py
-├── __main__.py
-└── tests/
-```
-
----
-
-## Module Reference — Diffusion
+## 4. Module Reference — Diffusion
 
 ### `train.py`
 
@@ -184,7 +159,7 @@ Wraps a frozen RETFound ViT-Large (via `timm`) with a trainable projection MLP.
 - ViT parameters are frozen (`requires_grad_(False)`) and kept in `eval()` permanently — `train()` override ensures only the projection MLP ever enters training mode.
 - Input preprocessing: bicubic resize to 224×224 → revert from diffusion `[-1,1]` to `[0,1]` → ImageNet normalize.
 - Output: `(B, 1, 768)` cross-attention conditioning tensor.
-- ImageNet mean/std registered as **buffers** (no per-call tensor allocation, optimization O6).
+- ImageNet mean/std registered as **buffers** (no per-call tensor allocation).
 
 #### `CachedConditioner`
 
@@ -192,8 +167,8 @@ A stateful wrapper around `RETFoundConditioner` that caches raw ViT features (no
 
 - Cache key: `(image_path, "full")` or `(image_path, tile_id)`.
 - LRU eviction via `move_to_end` / `popitem(last=False)`.
-- `get_full_image_cond(img, path)` — get conditioning for a full 512px image.
-- `get_tile_conds_batched(img_512, tile_views)` — single batched ViT forward pass for all 9 tiles (optimization fix #23, eliminates 9 sequential ViT calls during inference).
+- `get_full_image_cond(img, path)` — conditioning for a full 512px image.
+- `get_tile_conds_batched(img_512, tile_views)` — single batched ViT forward pass for all 9 tiles (eliminates 9 sequential ViT calls during inference).
 
 ---
 
@@ -201,7 +176,7 @@ A stateful wrapper around `RETFoundConditioner` that caches raw ViT features (no
 
 All diffusion math, MultiDiffusion tiling, and the retinal mask.
 
-**Noise functions** (named "simplex" for call-site compatibility, actually standard Gaussian):
+**Noise functions:**
 - `generate_simplex_noise` — `torch.randn`, shaped.
 - `add_simplex_noise` — standard DDPM forward process: `x_t = √ā·x₀ + √(1-ā)·ε`.
 - `simplex_ddim_step` — DDIM reverse step with optional stochasticity (`eta`). Clamps `pred_x0` to `[-1,1]`.
@@ -209,7 +184,7 @@ All diffusion math, MultiDiffusion tiling, and the retinal mask.
 **MultiDiffusion tiling constants:**
 
 | Constant | Value | Notes |
-|---|---|---|
+|----------|-------|-------|
 | `TILE_SIZE` | 256 | UNet input size |
 | `FULL_SIZE` | 512 | Full inference resolution |
 | `TILE_STRIDE` | 128 | 50% overlap |
@@ -217,42 +192,25 @@ All diffusion math, MultiDiffusion tiling, and the retinal mask.
 | `TILE_VIEWS` | 9 tiles | Precomputed `(h0,h1,w0,w1)` coordinates |
 
 - `make_linear_weight` — 2D pyramid weight for tile blending. Peaks at 1.0 in tile center, tapers to near-zero at edges, ensuring smooth seams. Cached per device (`_LINEAR_WEIGHT_CACHE`).
-- `make_retinal_mask` — Dynamic elliptical FOV mask:
-  1. Convert to `[0,1]`, threshold pixels < 0.05 as background.
-  2. Find bounding box of illuminated pixels per image in batch.
-  3. Fit an ellipse to the exact FOV bounds (independent `rx`, `ry`).
-  4. Returns intersection of illuminated pixels and ellipse — excludes black borders, camera vignette.
-- `multidiffusion_reconstruct` — Core inference loop:
-  1. Partially noise `img_512` to `T_start`.
-  2. Run DDIM denoising with per-tile UNet calls, fusing outputs via pyramid-weighted accumulation divided by precomputed `count`.
-  3. `dynamic_lcw` blends tile-specific local conditioning with global conditioning at each timestep.
-- `multidiffusion_reconstruct_full` — Adds retinal masking and computes L1 residual after `multidiffusion_reconstruct`.
-
-**Multi-scale residual** (`multiscale_residual`):
-- Runs separate reconstructions at 256px, 128px, 64px.
-- Upscales all back to 512px.
-- Takes element-wise **maximum** across scales (no weighted sum — avoids starving coarse scales).
-- Applies retinal mask.
+- `make_retinal_mask` — Dynamic elliptical FOV mask: threshold < 0.05 as background → fit ellipse to FOV bounds → returns intersection of illuminated pixels and ellipse.
+- `multidiffusion_reconstruct` — Core inference loop: partially noise → DDIM denoising with per-tile UNet calls, fusing outputs via pyramid-weighted accumulation, with `dynamic_lcw` blending tile-specific and global conditioning.
+- `multiscale_residual` — Runs separate reconstructions at 256px, 128px, 64px → upscale all to 512px → element-wise **maximum** across scales (no weighted sum — avoids starving coarse scales).
 
 ---
 
 ### `data.py`
 
 - `make_transform` — Builds torchvision transform pipeline. BILINEAR interpolation throughout (avoids bicubic ringing artifacts in L1 residuals).
-- Train augmentations: RandomResizedCrop (scale 0.8–1.0, ratio 0.9–1.1), RandomHorizontalFlip (p=0.5), RandomVerticalFlip (p=0.5), RandomRotation ±15°, ColorJitter (mild).
+- Train augmentations: RandomResizedCrop (scale 0.8–1.0), RandomHorizontalFlip, RandomVerticalFlip, RandomRotation ±15°, ColorJitter (mild).
 - Val: CenterCrop only.
 
-`RetinaDataset` — Accepts three source types:
-- `.csv` with a `path` or `image` column (handles relative paths using `csv_dir` as base, supports `source` column for per-source counts)
-- `.txt` newline-separated path list
-- Directory (recursive glob for jpg/jpeg/png)
+`RetinaDataset` — Accepts three source types: `.csv` (with `path`/`image` column), `.txt` (newline-separated paths), or directory (recursive glob).
 
 Features:
 - Optional `bad_files_txt` to pre-filter known corrupted files.
 - Retry loop (up to 10 attempts) to skip unreadable images at runtime without crashing.
 - Returns `(tensor, path)` tuples — paths are used as cache keys in `CachedConditioner`.
-
-`collate_fn` — Stacks tensors, keeps paths as a Python list (not tensor). Required for cache key usage.
+- `collate_fn` — Stacks tensors, keeps paths as a Python list (not tensor).
 
 ---
 
@@ -264,13 +222,11 @@ SNR(t) = ā_t / (1 - ā_t)
 weight(t) = clamp(SNR, max=γ) / (SNR + ε)
 loss = mean(weight × MSE(pred_noise, noise))
 ```
-- High noise (`t = 1000`): SNR ≈ 0, weight ≈ 1.0 — maximum penalty on coarse structure errors.
-- Low noise (`t = 0`): SNR >> γ, weight drops to γ/SNR — prevents obsessing over tile boundary micro-details.
 - γ=2.0 is intentionally aggressive (standard is 5.0) to synergize with the LCW tile fusion — stops the model from memorizing rigid 256px tile edges.
 
 `l1_focal_frequency_loss` — Two-component hybrid:
-1. **Spatial L1 (The Anchor):** `mean(|pred_x0 - x0|)` inside retinal mask. Provides stable, localized gradient for gross structure.
-2. **Focal Frequency Loss (The Sniper):** FFT on masked inputs → amplitude spectrum difference → self-weighted by `freq_diff.detach()` (harder frequencies get higher weight). Improves high-frequency lesion texture recovery.
+1. **Spatial L1 (The Anchor):** `mean(|pred_x0 - x0|)` inside retinal mask.
+2. **Focal Frequency Loss (The Sniper):** FFT on masked inputs → amplitude spectrum difference → self-weighted by `freq_diff.detach()` (harder frequencies get higher weight).  
 Combined: `L = L1 + 0.05 × FFL`
 
 `diffusion_loss` — Top-level combinator:
@@ -290,20 +246,7 @@ total = 0.6 × snr_weighted_loss + 0.4 × l1_focal_frequency_loss
 5. Combined vessel map → soft exponential suppression: `weight = exp(-1.5 × vessel_norm)`.
 6. Final retinal mask application + normalization to `[0,1]`.
 
-This preserves lesions adjacent to vessels (exponential decay, not hard clipping) while eliminating the dominant vessel signal that would otherwise dominate AUROC.
-
-`compute_ddr_metrics` — Full DDR evaluation:
-- Globs all `.jpg` / `.jpeg` / `.png` in `ddr_images_dir`.
-- For each, loads combined binary mask from `ddr_masks_dir/{MA,HE,EX,SE}/{stem}.tif`.
-- Runs `multidiffusion_reconstruct_full` → `postprocess_residual`.
-- Concatenates all pixel predictions and GT labels.
-- Computes pixel-level AUROC, AP, and best-threshold Dice (threshold sweep over 20 points in `[0.1, 0.9]`).
-- Supports time-budget (`max_seconds`) and count-budget (`max_images`) cutoffs with graceful early stopping.
-- VRAM defrag: `torch.cuda.empty_cache()` every 50 images.
-
-`compute_val_metrics` — SSIM/PSNR on validation batches. SDEdit AUROC removed (DDR is the only meaningful anomaly metric, per code comment).
-
-`compute_ssim` / `compute_psnr` — Pure numpy implementations, grayscale SSIM.
+`compute_ddr_metrics` — Full DDR evaluation: glob all images, combine 4-lesion-type masks (MA/HE/EX/SE), run `multidiffusion_reconstruct_full` → `postprocess_residual`, compute pixel-level AUROC/AP/Dice. Supports time-budget and count-budget cutoffs.
 
 ---
 
@@ -312,14 +255,14 @@ This preserves lesions adjacent to vessels (exponential decay, not hard clipping
 `save_visualizations` — Per-epoch 5-panel reconstruction grid:
 
 | Column | Content |
-|---|---|
+|--------|---------|
 | Original | Raw input |
 | Recon (masked) | Reconstruction × retinal mask |
 | Signed Diff | `(orig - recon)` in RdBu colormap, ±0.15 |
 | MultiScale | Multi-scale ensemble residual (hot) |
 | Clean Residual | Vessel-suppressed anomaly map (hot, normalized) |
 
-`save_anomaly_maps` — Per-image dark-theme 5-panel figure with overlay (original + alpha-blended hot anomaly map, α capped at 0.6).
+`save_anomaly_maps` — Per-image dark-theme 5-panel figure with overlay.
 
 `save_metrics_dashboard` — 4-panel matplotlib figure: AUROC/AP (val), SSIM, PSNR, DDR AUROC/Dice history.
 
@@ -327,12 +270,7 @@ This preserves lesions adjacent to vessels (exponential decay, not hard clipping
 
 ### `sweep.py`
 
-`run_sweep` — Grid search over `T_start × DDIM_steps × max_lcw`:
-- Iterates all parameter combinations for each sweep image.
-- Saves per-combo reconstructions and vessel-suppressed residual heatmaps.
-- Applies Frangi Vessel Suppression (`postprocess_residual`) directly to the sweep outputs so the generated hyperparameter heatmaps evaluate true lesions rather than healthy vascular structures.
-- Writes `sweep_metrics.csv` with SSIM, PSNR, residual mean/max, and wall-clock seconds per combo.
-- Generates panel plots (grid of DDIM_steps × T_start) per image per LCW value.
+`run_sweep` — Grid search over `T_start × DDIM_steps × max_lcw`. Saves per-combo reconstructions and vessel-suppressed residual heatmaps. Writes `sweep_metrics.csv` with SSIM, PSNR, residual mean/max, and wall-clock seconds per combo. Generates panel plots per image per LCW value.
 
 Activated via `sweep.enabled: true` in config — runs instead of training when set.
 
@@ -340,18 +278,16 @@ Activated via `sweep.enabled: true` in config — runs instead of training when 
 
 ### `utils.py`
 
-- `strip_compile_prefix` — Strips `_orig_mod.` from state dicts saved under `torch.compile`, enabling cross-compiled/uncompiled checkpoint loading.
-- `repair_csv_header` — Rewrites a CSV header in-place if the schema on disk differs from the current expected columns (handles checkpoint resume across schema changes).
-- `append_csv_row` — Safe CSV append with exception handling so a disk write failure never crashes training.
-- `load_loss_history` — Parses `loss.csv` with schema tolerance (missing columns default to `None`) to reconstruct LCW history curves on resume.
-- `_TeeStream` / `setup_terminal_logging` — Redirects `stdout` and `stderr` to both console and a log file simultaneously via `atexit`-registered cleanup.
-- `save_lcw_curve` — Plots the LCW schedule as experienced during training (epoch progress vs LCW value, with scatter downsampling for large runs).
+- `strip_compile_prefix` — Strips `_orig_mod.` from state dicts saved under `torch.compile`.
+- `repair_csv_header` — Rewrites a CSV header in-place if the schema on disk differs from current expected columns.
+- `append_csv_row` — Safe CSV append with exception handling.
+- `load_loss_history` — Parses `loss.csv` with schema tolerance.
+- `_TeeStream` / `setup_terminal_logging` — Redirects stdout and stderr to both console and a log file simultaneously.
+- `save_lcw_curve` — Plots the LCW schedule as experienced during training.
 
 ---
 
-### `config.yaml`
-
-Single YAML file controlling all behavior. No hardcoded paths in code.
+### `config.yaml` (Diffusion)
 
 ```yaml
 paths:
@@ -363,69 +299,57 @@ paths:
   ddr_images_dir:   # DDR evaluation image directory
   ddr_masks_dir:    # DDR evaluation mask directory (MA/HE/EX/SE subdirs)
   idrid_images_dir: # iDRiD evaluation image directory
-  idrid_masks_dir:  # iDRiD evaluation mask directory (MA/HE/EX/SE subdirs)
+  idrid_masks_dir:  # iDRiD evaluation mask directory
   retfound_weights: # Path to RETFound_cfp_weights.pth
 
 sweep:
   enabled:    false
-  csv:                     # Images to sweep over
-  out_dir:                 # Where to save sweep outputs
-  t_starts:   [200,250,300,350]
+  t_starts:   [200, 250, 300, 350]
   ddim_steps: [50]
   lcw_values: [0.4]
 
 training:
-  crop_size:         512   # Training crop (tiles are 256×256 within this)
+  crop_size:         512
   epochs:            20
   batch_size:        6
   accum_steps:       6     # Effective batch = batch_size × accum_steps = 36
   warmup_epochs:     3
-  num_workers_train: 4
-  num_workers_val:   0
-  prefetch_factor:   2
   lr_unet:           5e-6
   lr_conditioner:    1e-5
   snr_gamma:         2.0
 
 diffusion:
-  simplex_freq:     8      # Unused (Gaussian noise used)
-  simplex_octaves:  4      # Unused
   ddim_steps:       50
-  ddim_t_start:     300    # Partial noising depth for SDEdit
-  max_train_lcw:    0.4    # Peak local conditioning weight
+  ddim_t_start:     300   # Partial noising depth for SDEdit
+  max_train_lcw:    0.4   # Peak local conditioning weight
 
 eval:
-  vis_every:          1    # Visualize every N epochs
-  eval_every:         10   # SSIM/PSNR every N epochs
-  num_vis:            1    # Number of images in vis panel
-  ddr_eval_every:     10   # DDR AUROC every N epochs
-  ddr_max_images:     ~    # null = all paired images
-  ddr_max_seconds:    ~    # null = no time cap
-  idrid_eval_every:   10   # iDRiD AUROC every N epochs
-  idrid_max_images:   ~
-  idrid_max_seconds:  ~
-  lcw_plot_every:     50   # Save LCW curve every N steps
+  vis_every:         1
+  eval_every:        10
+  ddr_eval_every:    10
+  ddr_max_images:    ~    # null = all images
+  ddr_max_seconds:   ~    # null = no time cap
 ```
 
 ---
 
-## Key Design Decisions — Diffusion
+## 5. Key Design Decisions — Diffusion
 
 | Decision | Rationale |
-|---|---|
+|----------|-----------|
 | Train on 256px tiles, infer on 512px via MultiDiffusion | UNet fits in VRAM at 256px; MultiDiffusion fuses overlapping tiles for seamless 512px output |
 | Frozen RETFound ViT-Large | RETFound captures fundus-specific anatomy; fine-tuning would destroy the generic healthy-retina prior |
 | Cache raw ViT features, not proj MLP outputs | Proj MLP trains, so caching its output would cause stale gradients across iterations |
 | SNR-γ=2.0 (aggressive) | Paired with LCW: prevents the model from overfitting tile boundary micro-textures at low noise |
-| Frangi on both input green channel AND residual | Green channel catches vascular anatomy; residual Frangi catches vessel-shaped reconstruction artifacts the model introduces |
-| Element-wise max for multi-scale ensemble | Weighted sum would cap small-scale lesion signal (at 0.2 weight for 64px scale); max lets each scale compete at full confidence |
-| LCW rises with cosine schedule over full training run | Prevents tile-specific conditioning from overwhelming global structure conditioning before the UNet has learned coarse anatomy |
+| Frangi on both input green channel AND residual | Green channel catches vascular anatomy; residual Frangi catches vessel-shaped reconstruction artifacts |
+| Element-wise max for multi-scale ensemble | Weighted sum would cap small-scale lesion signal; max lets each scale compete at full confidence |
+| LCW rises with cosine schedule over full training | Prevents tile-specific conditioning from overwhelming global structure conditioning before the UNet learns coarse anatomy |
 | BILINEAR interpolation throughout data pipeline | Avoids bicubic ringing artifacts that contaminate the L1 residual anomaly map |
-| xformers disabled when `torch.compile` is active | Compile + xformers causes attention processor identity checks to thrash the dynamo cache (set to 64 limit) |
+| xformers disabled when `torch.compile` is active | Compile + xformers causes attention processor identity checks to thrash the dynamo cache |
 
 ---
 
-## Training Pipeline
+## 6. Diffusion Training Pipeline
 
 ```
 Epoch start
@@ -437,7 +361,7 @@ Epoch start
 |   ├── CachedConditioner → ViT features (LRU cached per path)
 |   ├── add_simplex_noise → x_t at random t ∈ [0, 1000]
 |   ├── autocast forward → pred_noise
-|   ├── diffusion_loss (SNR + FFL hybrid)
+|   ├── diffusion_loss (0.6 × SNR-weighted + 0.4 × FFL hybrid)
 |   ├── GradScaler backward
 |   └── every ACCUM_STEPS: clip_grad_norm(1.0) → optimizer.step()
 |
@@ -450,14 +374,14 @@ Epoch start
 
 ---
 
-## Inference Pipeline
+## 7. Diffusion Inference Pipeline
 
 ```
 Input: 512×512 fundus image
 
-1. CachedConditioner.get_full_image_cond()  →  global_cond (1,1,768)
-2. CachedConditioner.get_tile_conds_batched()  →  9× local_cond (1,1,768)
-3. add_simplex_noise(img, T_start=300)  →  x_T
+1. CachedConditioner.get_full_image_cond()    →  global_cond (1,1,768)
+2. CachedConditioner.get_tile_conds_batched() →  9× local_cond (1,1,768)
+3. add_simplex_noise(img, T_start=300)        →  x_T
 4. DDIM loop (50 steps):
    For each of 9 tiles:
      tile_cond = LCW(t) × local_cond + (1 - LCW(t)) × global_cond
@@ -474,66 +398,46 @@ Input: 512×512 fundus image
 8. Output: anomaly_map ∈ [0,1], pixel-level
 ```
 
+The anomaly map is then saved and used as input to the Classifier pipeline.
+
 ---
 
-## Evaluation
+## 8. Evaluation
 
 ### DDR Dataset
-- 757 labeled fundus images with pixel-level annotations for 4 lesion types:
-  - **MA** — Microaneurysms
-  - **HE** — Hemorrhages
-  - **EX** — Hard Exudates
-  - **SE** — Soft Exudates (Cotton Wool Spots)
+- 757 labeled fundus images with pixel-level annotations: **MA** (Microaneurysms), **HE** (Hemorrhages), **EX** (Hard Exudates), **SE** (Soft Exudates).
 - Masks combined into a single binary map (logical OR across lesion types).
 - Pixel-level metrics: **AUROC** (primary), **AP**, **Dice** (best threshold via sweep).
-- Expected directory structure:
-  ```
-  ddr_masks_dir/
-  ├── MA/  {stem}.tif
-  ├── HE/  {stem}.tif
-  ├── EX/  {stem}.tif
-  └── SE/  {stem}.tif
-  ```
+- Required structure: `ddr_masks_dir/{MA,HE,EX,SE}/{stem}.tif`
 
 ### iDRiD Dataset
-- 81 labeled fundus images with pixel-level annotations for 4 lesion types (MA, HE, EX, SE).
-- Masks combined into a single binary map (logical OR across lesion types).
-- Pixel-level metrics: **AUROC** (primary), **AP**, **Dice** (best threshold via sweep).
-- Expected directory structure:
-  ```
-  idrid_masks_dir/
-  ├── MA/  {stem}.tif
-  ├── HE/  {stem}.tif
-  ├── EX/  {stem}.tif
-  └── SE/  {stem}.tif
-  ```
+- 81 labeled fundus images with the same 4 lesion type annotations.
+- Same evaluation protocol as DDR.
+- Required structure: `idrid_masks_dir/{MA,HE,EX,SE}/{stem}.tif`
 
 ---
 
-## Checkpoints
+## 9. Checkpoints
 
 All checkpoints saved to `checkpoint_dir`:
 
 | File | Contents |
-|---|---|
+|------|---------|
 | `last.pt` | Full training state: model, conditioner_proj, optimizer, scaler, scheduler, epoch, best metrics |
 | `best_loss.pt` | Snapshot at lowest validation loss |
 | `best_auroc.pt` | Snapshot at highest DDR AUROC |
 | `loss.csv` | Per-epoch: train_loss, val_loss, snr, ms, val_snr, val_ms, lr, lcw |
 | `metrics.csv` | Per-eval: SSIM, PSNR, pixel_auroc, pixel_ap |
 | `ddr_metrics.csv` | Per-DDR-eval: ddr_auroc, ddr_ap, ddr_dice, ddr_thresh, n_images |
-| `idrid_metrics.csv` | Per-iDRiD-eval: idrid_auroc, idrid_ap, idrid_dice, idrid_thresh, n_images |
-| `epoch_metrics.csv` | Combined per-epoch summary |
 | `train_terminal.log` | Full stdout/stderr mirror |
 | `lcw_curve.png` | LCW vs epoch progress plot |
 | `metrics_dashboard.png` | 4-panel metrics history figure |
 | `recon_epoch_XXXX.png` | Per-epoch reconstruction panels |
-| `anomaly_maps_raw/` | Per-image hot-colormap anomaly maps |
 | `anomaly_maps/` | Per-image dark-theme overlay panels |
 
 ---
 
-## Requirements
+## 10. Requirements
 
 ```
 torch >= 2.0
@@ -554,24 +458,22 @@ pyyaml
 Optional:
 ```
 xformers           # Memory-efficient attention (disabled when torch.compile is active)
+xgboost            # Phase 2 classifier training
+shap               # Feature importance analysis
 ```
 
 ---
 
-## Usage — Diffusion
+## 11. Usage — Diffusion
 
-**Train:**
 ```bash
+# Train
 python -m diffusion.train --config diffusion/config.yaml
-```
 
-*For persistent logging in a detached session:*
-```bash
-python -m diffusion.train --config diffusion/config.yaml 2>&1 | tee -a checkpoints_512v4/train.log
-```
+# With persistent logging in a detached session
+python -m diffusion.train --config diffusion/config.yaml 2>&1 | tee -a checkpoints/train.log
 
-**Sweep mode** (set `sweep.enabled: true` in config):
-```bash
+# Sweep mode (set sweep.enabled: true in config)
 python -m diffusion.train --config diffusion/config.yaml
 ```
 
@@ -580,223 +482,532 @@ python -m diffusion.train --config diffusion/config.yaml
 **Warm-start from 256px checkpoint:** Set `paths.pretrained_256` to your 256px `last.pt`. LR is automatically scaled to 30% base and warmup reduced to 1 epoch.
 
 ---
+---
+
+# Part II — Classifier Pipeline
 
 ---
 
-# Classifier Pipeline
+## 12. Classifier Overview
 
-The `classifier/` module takes the diffusion model's **clean residual anomaly maps** and trains a hybrid deep learning + classical ML pipeline to classify retinal images into three disease categories: **Diabetic Retinopathy (DR)**, **Glaucoma**, and **Pathologic Myopia (PM)**.
+The `classifier/` module takes the diffusion model's **clean residual anomaly maps** and classifies retinal images into three disease categories: **Diabetic Retinopathy (DR)**, **Glaucoma**, and **Pathological Myopia (PM)**.
 
-> The diffusion model generates the *where* (anomaly maps). The classifier determines the *what* (disease label).
+The classifier is a two-phase pipeline:
+- **Phase 1** — End-to-end differentiable training: dual-stream encoder (MIT-B3 SegFormer + pre-cached RETFound) with expert branches, dual VIB bottleneck, and BCEWithLogits losses.
+- **Phase 2** — Static feature extraction → 3 independent binary XGBoost classifiers.
+
+Labels are **multi-label** (BCEWithLogitsLoss, not Softmax). DR, Glaucoma, and PM are not mutually exclusive — a patient can have all three simultaneously.
 
 ---
 
-## Classifier Architecture
+## 13. Classifier Architecture — Full Breakdown
 
 ```
-Retina Image (512×512)
-        │
-        ├──[ONE TIME]──▶ RETFound-Large (frozen ViT-L/16)
-        │                      │
-        │               1024-D .pt cache (per image)
-        │               key: {split}_{class}_{stem}.pt
-        │
-        └──▶ MIT-B3 SegFormer (ImageNet init, trainable)
-                    │
-             Custom Decode Head
-             F_concat  (B × 1024 × 128 × 128)
-                    │
-             Late Spatial Gate
-             F_gated = F + α·(F ⊙ A_scaled)    α = learned scalar
-                    │
-             Global Avg Pool  →  (B × 1024)
-                    │
-        ┌───────────┴───────────┐
-     Path A                 Path B (VIB)
-  Linear(1024→384)       Linear(1024→768)
-     384-D                 μ(384) + log_σ²(384)
-     raw context         Training: z = μ + σε
-                         Inference: z = μ  (deterministic)
-        └───────────┬───────────┘
-                    │ + scalar: mean(A_scaled)  [1-D]
-                    ▼
-              769-D Vector
-                    │
-         Load cached 1024-D RETFound embedding
-                    │
-              1793-D Vector
-                    ▼
-               XGBoost (tree_method=hist, GPU)
-          DR / Glaucoma / PM + confidence %
+================================================================================
+                PHASE 1: END-TO-END DIFFERENTIABLE TRAINING
+================================================================================
+
+  [ 6-Channel Stack ]                        [ Pre-Cached RETFound Embedding ]
+(3ch RGB + 3ch Clean Residual)                        (1024-D, from disk)
+         |                                                      |
+         v                                                      v
+[ MIT-B3 SEGFORMER ]                                   (loaded by DataLoader
+  (6ch input, trains)                                  — never runs live)
+         |
+  hidden[0]        hidden[2]       hidden[3]
+ (128×128×64)    (32×32×320)     (16×16×512)
+         |              |               |
+    [ DR HEAD ]   [ GLAUC HEAD ]   [ PM HEAD ]
+    1x1 → 3x3     1x1 → 3x3      SE-Block (no spatial conv)
+    CBAM → Pool    CBAM → Pool    GAP → MLP
+         |              |               |
+       256-D           256-D          256-D
+         └──────────────┴───────────────┘
+                        |
+                     768-D
+                        |
+                    [ VIB 1 ]
+                768 → 256 (hidden) → 128
+                        |
+            128-D (z1, μ1, log_σ²1)
+             ┌──────────┴──────────┐
+             |                     |
+  [ Aux Linear Classifier ]        |
+     (128 → 3, BCEWithLogits)      |
+             |                     |      [ VIB 2 ]
+          (L_aux)                  |  1024 → 256 → 128
+                                   |      |
+                                   |  128-D (z2, μ2, log_σ²2)
+                                   |      |
+                           z1 (128) ⊕ z2 (128) = 256-D fused
+                                       |
+                           [ Main Linear Classifier ]
+                              (256 → 3, BCEWithLogits)
+                                       |
+                                    (L_main)
+
+    L_total = L_main + λ_aux · L_aux + β · (KL₁ + KL₂)
+
+================================================================================
+                PHASE 2: FEATURE EXTRACTION & META-CLASSIFICATION
+================================================================================
+
+  1. FREEZE all weights.  2. SET eval mode (VIBs → deterministic μ, ε=0)
+  3. DROP Aux + Main classifiers (training scaffolding, not used in inference)
+  4. FORWARD every image → extract 256-D z_fused
+  5. SAVE to features/train_features.npy, features/val_features.npy
+  6. TRAIN 3 independent binary XGBoost classifiers
+
+        [ 256-D Extracted Vector ]
+                    |
+        ┌───────────┼───────────┐
+        v           v           v
+ [XGBoost_DR]  [XGBoost_Glauc]  [XGBoost_PM]
+        |           |           |
+     P(DR)       P(Glauc)     P(PM)
+  (independent sigmoid — NOT softmax — does NOT sum to 1)
 ```
 
-### Loss Function
+### Stage 1 — 6-Channel Input Construction
 
-No cross-entropy head. SupCon is the **sole** supervisory signal during SegFormer training:
+```
+RGB Image (3ch, ImageNet-normalised)    +    Clean Residual (3ch, [0,1] replicated)
+                                six_ch = cat([image, residual], dim=0)  →  (6, 512, 512)
+```
 
-$$\mathcal{L}_{total} = \underbrace{\mathcal{L}_{SupCon}}_{1.0} + \underbrace{1.0 \cdot \beta(t) \cdot \mathcal{L}_{KL}}_{\text{VIB bottleneck}} + \underbrace{0.1 \cdot \mathcal{L}_{Ortho}}_{\mu\ \text{only}}$$
+The residual channels 3-5 are **zero-initialised** in the patch_embed projection — the model starts with exactly the pretrained RGB behavior and learns to use the residual channels from scratch. This is safer than random init (which corrupts pretrained weights) or copy init (which gives the residual the same interpretation as RGB, which is wrong).
 
-| Loss | Applied to | Purpose |
-|---|---|---|
-| **SupCon** | Full 769-D vector | Forces same-disease vectors to cluster, pushes apart different diseases |
-| **KL** (`β`-annealed) | Path B μ, log_σ² | VIB bottleneck — discards noisy features, keeps strongest disease signals |
-| **Ortho** | Path B **μ only** | Cosine similarity penalty — forces distinct, non-overlapping features per class |
+### Stage 2 — MIT-B3 SegFormer (Stream A)
 
-**β-annealing:** β = 0 for first 10 epochs → linearly ramps to 0.001 over next 20 epochs. `lambda_kl = 1.0` is a transparent pass-through — β via `BetaScheduler` is the **sole** bottleneck coefficient (matching Alemi et al. 2017 and Higgins et al. 2017).
+MIT-B3 hierarchical Mix Transformer with 4 stages. The first patch embedding projection is surgically adapted from `Conv2d(3, 64)` to `Conv2d(6, 64)` with the zero-init strategy above. All other weights stay pretrained.
 
-**Class balance:** `WeightedRandomSampler` enforces 1:1:1 (DR:Glaucoma:PM) per batch + class-aware SupCon temperature (PM uses τ=0.04 vs 0.07).
+**Stage output dimensions at 512×512 input:**
+
+| Stage | `hidden_states[]` | Spatial | Channels | Used by |
+|-------|-------------------|---------|----------|---------|
+| 1 | `[0]` | 128×128 | 64 | DR Head |
+| 2 | `[1]` | 64×64 | 128 | — |
+| 3 | `[2]` | 32×32 | 320 | Glauc Head |
+| 4 | `[3]` | 16×16 | 512 | PM Head |
+
+### Stage 3 — Expert Branches
+
+#### DR Head (Scale `hidden[0]`, 128×128×64)
+```
+Conv2d(64 → 128, kernel=1) → Conv2d(128 → 128, kernel=3) → BN + GELU
+→ CBAM (channel + spatial attention)
+→ AdaptiveAvgPool2d(1) → Flatten
+→ Linear(128 → 256) + GELU + Dropout(0.3)
+Output: (B, 256)
+```
+**Why Scale 0?** DR is microaneurysms, dot haemorrhages, hard exudates — tiny, spatially precise features. Scale 0 preserves the highest spatial resolution (128px). **Why CBAM?** It simultaneously identifies which channels encode lesion types AND where spatially they appear.
+
+#### Glauc Head (Scale `hidden[2]`, 32×32×320)
+```
+Conv2d(320 → 256, kernel=1) → Conv2d(256 → 256, kernel=3) → BN + GELU
+→ CBAM (channel + spatial attention)
+→ AdaptiveAvgPool2d(1) → Flatten
+→ Linear(256 → 256) + GELU + Dropout(0.3)
+Output: (B, 256)
+```
+**Why Scale 2?** Glaucoma signature is optic disc CDR enlargement and rim thinning. The optic disc occupies ~1/8 of the image. At Scale 2 (32×32), the disc maps to 4-6 pixels — enough for disc/cup boundary assessment without high-resolution vessel noise.
+
+#### PM Head (Scale `hidden[3]`, 16×16×512)
+```
+SE-Block (channel-only attention):
+    AdaptiveAvgPool2d(1) → Flatten → Linear(512→32) → ReLU → Linear(32→512) → Sigmoid
+    Output = Input × scale   [pure channel re-weighting, NO spatial conv]
+→ AdaptiveAvgPool2d(1) → Flatten
+→ Linear(512 → 256) + GELU + Dropout(0.3)
+Output: (B, 256)
+```
+**Why NO spatial convolutions?** SegFormer Scale 3 uses self-attention — every spatial position already contains context from the whole image. Applying a spatial conv to these features is redundant. SE-Block asks *"which channels fire for global deformation?"* — the correct question for a global structural disease like PM (axial elongation, posterior staphyloma).
+
+### Stage 4 — Dual VIB
+
+```
+fused_768 = cat([dr_feat, glauc_feat, pm_feat])  →  (B, 768)
+
+VIB 1  →  768 → Linear(256) + GELU → μ₁ (128), log_σ²₁ (128)
+VIB 2  →  1024 → Linear(256) + GELU → μ₂ (128), log_σ²₂ (128)
+
+Training:   z_i = μ_i + exp(0.5 × log_σ²_i) ⊙ ε,   ε ~ N(0, I)
+Inference:  z_i = μ_i   (deterministic — XGBoost requires stable split thresholds)
+
+z_fused = cat([z₁, z₂])  →  (B, 256)
+```
+
+**Why two VIBs?** A single VIB on the 1792-D concatenation would allow the optimizer to collapse z₁ to N(0,I) and free-ride entirely on the frozen RETFound signal (z₂). Two separate VIBs force each stream to independently justify its own compression.
+
+### Stage 5 — Temporary Phase-1 Classifiers
+
+```python
+aux_classifier  = nn.Linear(128, 3)   # on z₁ alone → L_aux
+main_classifier = nn.Linear(256, 3)   # on z_fused  → L_main
+```
+
+**Discarded after Phase 1.** Without `aux_classifier`, VIB1 can minimize `L_main` perfectly by routing through z₂ and setting z₁ → N(0,I). `L_aux` creates a gradient path that depends **only** on z₁ — VIB1 cannot escape it.
+
+### Stage 6 — XGBoost Meta-Classification
+
+Three independent binary classifiers on the static 256-D vectors:
+
+| Model | Objective | Eval Metric | Saves to |
+|-------|-----------|------------|---------|
+| `xgb_DR.pkl` | `binary:logistic` | AUC | `xgboost/xgb_DR.pkl` |
+| `xgb_Glaucoma.pkl` | `binary:logistic` | AUC | `xgboost/xgb_Glaucoma.pkl` |
+| `xgb_PM.pkl` | `binary:logistic` | AUC | `xgboost/xgb_PM.pkl` |
+
+**Why 3 binary classifiers?** `multi:softmax` forces probabilities to sum to 1, mathematically suppressing comorbidities. Three independent sigmoid outputs produce separate confidences that can all be high simultaneously.
 
 ---
 
-## Classifier Project Structure
+## 14. Loss Function Deep Dive
+
+```
+L_total = L_main + λ_aux · L_aux + β · λ_kl · (KL₁ + KL₂)
+```
+
+| Term | Formula | Weight | Purpose |
+|------|---------|--------|---------|
+| `L_main` | `BCEWithLogitsLoss(main_classifier(z_fused), label_vec)` | 1.0 | Primary disease signal |
+| `L_aux` | `BCEWithLogitsLoss(aux_classifier(z₁), label_vec)` | `λ_aux = 0.4` | Forces VIB1 to encode disease independently |
+| `KL₁` | `-½ Σ(1 + log_σ²₁ - μ₁² - σ₁²)` | `β × λ_kl` | Compresses custom head stream |
+| `KL₂` | `-½ Σ(1 + log_σ²₂ - μ₂² - σ₂²)` | `β × λ_kl` | Compresses RETFound stream |
+
+`label_vec` is a `(B, 3)` float multi-hot vector: `[1,0,0]` for DR-only, `[1,1,0]` for DR+Glaucoma, etc.
+
+### β-Annealing Schedule
+
+```
+Epochs [0, 10):    β = 0.0      ← classifiers establish clusters first
+Epochs [10, 30):   β = 0 → 0.001  (linear ramp)
+Epochs [30, end]:  β = 0.001   ← gentle constant compression
+```
+
+Starting at β=0 is critical. At epoch 0, VIBs produce garbage. High β would collapse both VIBs to N(0,I) immediately (zero KL = cheap). The classifiers get noise and learn nothing. Starting at β=0 lets `L_main` and `L_aux` establish disease-separating clusters first, then β compresses those meaningful clusters.
+
+---
+
+## 15. Two-Phase Training Strategy
+
+### Phase 1 — End-to-End Differentiable
+
+| Component | Mode | LR |
+|-----------|------|----|
+| MIT-B3 backbone (pretrained) | Trains | `lr × 0.1 = 1e-5` |
+| DR / Glauc / PM Expert Heads | Trains | `lr = 1e-4` |
+| VIB 1 + VIB 2 | Trains | `lr = 1e-4` |
+| Aux Classifier + Main Classifier | Trains | `lr = 1e-4` |
+| RETFound ViT-Large | **Frozen** | 0 |
+
+10× lower LR for the backbone preserves its pretrained ImageNet representations while the new expert heads learn from scratch at normal speed.
+
+### Phase 2 — Feature Extraction → XGBoost
+
+1. Load best Phase 1 checkpoint (`best.pt`)
+2. `model.eval()` → VIBs deterministic (`z = μ`, `ε = 0`)
+3. Freeze all weights
+4. Forward every image → collect `z_fused` (256-D)
+5. Save as NumPy arrays to `features/`
+6. Train 3 binary XGBoost classifiers
+
+**Why ε=0 at extraction?** XGBoost builds decision trees that find consistent split thresholds. If z is stochastic, the same image produces a slightly different 256-D vector each time — trees cannot find stable splits. Using μ gives XGBoost a deterministic, reproducible tabular input.
+
+---
+
+## 16. Why These Architectural Choices
+
+| Choice | Alternative | Why This Was Chosen |
+|--------|------------|---------------------|
+| 6-channel input (RGB + residual) | Late-fusion gate | Bakes diffusion prior into backbone's earliest feature computation. Gate was an add-on; 6ch makes the residual a first-class input. |
+| 3 expert heads on different scales | Single decode head, all scales fused | Each disease lives at a different spatial frequency. One head can't optimise all three simultaneously. |
+| SE-Block (no spatial conv) for PM | 3×3 conv + spatial attention | SegFormer Scale 3 features already contain global self-attention. Spatial conv would be redundant and add wrong inductive bias. |
+| Dual VIB | Single VIB on 1792-D concat | Single VIB allows optimizer to free-ride on frozen RETFound. Dual VIB forces independent compression per stream. |
+| Aux classifier on z₁ | Gradient scaling / warmup tricks | Aux loss is path-of-no-escape for VIB1 — it must encode disease signal or its own loss explodes. Clean and principled. |
+| 3 binary XGBoost | 1 multiclass XGBoost (softmax) | Diseases are not mutually exclusive. Softmax suppresses valid comorbidity signals. |
+| Pre-cached RETFound | RETFound live during training | Saves ~1.2GB VRAM and 3-5× training time. RETFound's weights never change; recomputing every epoch is pure waste. |
+| BCEWithLogitsLoss | SupCon + Ortho | BCE provides direct, interpretable disease prediction. For multi-label setup (comorbidities), BCE is the natural choice. |
+
+---
+
+## 17. Classifier Project Structure
 
 ```
 classifier/
-├── config.yaml          ← All hyperparameters
-├── model.py             ← NetrAiEncoder (SegFormer + gate + VIB bottleneck)
-├── losses.py            ← SupCon + KL + Ortho + BetaScheduler + NetrAiLoss
-├── data.py              ← RetinalDataset + balanced DataLoader
-├── retfound.py          ← RETFound pre-computation + collision-safe cache I/O
-├── train.py             ← SegFormer training loop (AMP, dual LR, checkpointing)
-├── extract.py           ← 769-D → 1793-D feature extraction to .npy
-├── xgboost_clf.py       ← XGBoost train / eval / SHAP (tree_method=hist)
-├── inference.py         ← Single-image end-to-end diagnosis
+├── config.yaml          ← Master hyperparameter file
+├── model.py             ← CBAM, SEBlock, DRHead, GlaucHead, PMHead,
+│                           VIB, NetrAiEncoder (dual VIB + temp classifiers)
+├── losses.py            ← BCEWithLogitsLoss (main + aux) + dual KL + BetaScheduler
+├── data.py              ← RetinalDataset (6ch stack + RETFound cache + multi-hot labels)
+│                           + build_dataloader (WeightedRandomSampler)
+├── retfound.py          ← RETFoundExtractor + precompute cache + cache I/O
+│                           (UNCHANGED — cache format fully compatible)
+├── train.py             ← Phase 1 Trainer class (AMP, dual LR groups, checkpoint)
+├── extract.py           ← Phase 2: frozen 256-D extraction to .npy
+├── xgboost_clf.py       ← BinaryXGBoost × 3 + NetrAiXGBoost wrapper + SHAP
+├── inference.py         ← Single-image end-to-end pipeline
 ├── utils.py             ← Logging, checkpointing, metrics, LR scheduler
 ├── requirements.txt
 ├── __init__.py
-├── __main__.py          ← CLI dispatcher (5 commands)
+├── __main__.py          ← CLI dispatcher
 └── tests/
     ├── conftest.py      ← Shared pytest fixtures (temp dataset, no GPU needed)
-    ├── test_model.py    ← Model shape + gradient contracts
+    ├── test_model.py    ← Shape + gradient contracts
     ├── test_losses.py   ← Loss function unit tests
     └── test_data.py     ← Dataset + DataLoader tests
 ```
 
 ---
 
-## Classifier Setup
+## 18. Data Layout
+
+```
+data/
+├── classifier/
+│   ├── train/
+│   │   ├── DR/          ← .jpg / .png retina images
+│   │   ├── Glaucoma/
+│   │   └── PM/
+│   └── val/
+│       ├── DR/
+│       ├── Glaucoma/
+│       └── PM/
+├── anomaly_maps/
+│   ├── <image_stem>_anomaly.png   ← preferred naming
+│   └── <image_stem>.png           ← fallback naming
+└── retfound_cache/                ← generated by cache-retfound step
+    ├── train_DR_image_001.pt
+    ├── train_Glaucoma_scan_042.pt
+    └── ...
+```
+
+> **Missing anomaly map**: residual channels default to zeros. Model degrades gracefully.  
+> **Missing RETFound cache**: VIB2 receives zeros. Aux classifier on z₁ still forces VIB1 to learn. Model degrades gracefully.
+
+**Class balance:** `WeightedRandomSampler` enforces 1:1:1 (DR:Glaucoma:PM) per batch during training. Each sample weight = `total / (n_classes × class_count)`. Validation uses unbalanced sequential iteration to evaluate on the true class distribution.
+
+---
+
+## 19. Classifier Setup
 
 ```bash
 # Install dependencies
 pip install -r classifier/requirements.txt
 
-# Verify tests pass (no GPU, no downloads required)
+# Verify test suite passes (no GPU, no downloads required)
 pytest classifier/tests/ -v
 ```
 
----
+### VRAM Requirements
 
-## Classifier Training Pipeline
+| Component | fp32 | bf16 (AMP) |
+|-----------|------|-----------|
+| MIT-B3 SegFormer | ~180 MB | ~90 MB |
+| Expert heads + VIBs | ~50 MB | ~25 MB |
+| Activations (batch=8, 512px) | ~8-10 GB | ~4-5 GB |
+| RETFound (Phase 1) | **0 MB** (cached) | **0 MB** |
+| **Total (Phase 1, batch=8)** | **~10-12 GB** | **~5-6 GB** |
 
-### Step 0 — Prepare Data
-
-Organise images into class folders:
-
-```
-data/classifier/
-├── train/
-│   ├── DR/          ← .jpg / .png retina images
-│   ├── Glaucoma/
-│   └── PM/
-└── val/
-    ├── DR/
-    ├── Glaucoma/
-    └── PM/
-```
-
-Place the diffusion model's **clean residual** anomaly maps in a flat directory:
-
-```
-data/anomaly_maps/
-├── <image_stem>_anomaly.png   ← preferred naming
-└── <image_stem>.png           ← fallback naming
-```
-
-> If an anomaly map is missing, the gate defaults to `F_gated = F_concat` (identity — no anomaly guidance). Training continues without the diffusion prior for that sample.
-
-Update paths in `classifier/config.yaml` to match your directory layout.
+With 20GB VRAM, batch size 8-12 is safe. AMP is enabled by default.
 
 ---
 
-### Step 1 — Cache RETFound Embeddings *(one time)*
+## 20. Classifier Pipeline — Step by Step
+
+### Step 0 — Configure Paths
+
+Edit `classifier/config.yaml`:
+```yaml
+paths:
+  data_dir:           "data/classifier"
+  anomaly_maps_dir:   "data/anomaly_maps"
+  checkpoint_dir:     "checkpoints/classifier"
+  features_dir:       "features"
+  retfound_cache_dir: "retfound_cache"
+  retfound_weights:   "path/to/RETFound_cfp_weights.pth"
+```
+
+Download RETFound weights from [RETFound repository](https://github.com/rmaphoh/RETFound_MAE).
+
+---
+
+### Step 1 — Cache RETFound Embeddings *(one-time, ~minutes)*
 
 ```bash
 python -m classifier cache-retfound --config classifier/config.yaml
+
+# Force recompute
+python -m classifier cache-retfound --config classifier/config.yaml --overwrite
 ```
 
-Runs every image through frozen RETFound-Large. Saves collision-safe 1024-D `.pt` files:
-- `train/DR/img_001.png` → `retfound_cache/train_DR_img_001.pt`
-- `val/Glaucoma/img_001.png` → `retfound_cache/val_Glaucoma_img_001.pt`
-
-RETFound is then unloaded from VRAM permanently.
-
-> **RETFound weights**: Download `RETFound_cfp_weights.pth` from the [RETFound repository](https://github.com/rmaphoh/RETFound_MAE) and set `paths.retfound_weights` in `config.yaml`. Falls back to HuggingFace ViT-L/16 ImageNet-21k if not provided (domain gap applies).
+Runs every image through frozen RETFound-Large. Saves `<split>_<class>_<stem>.pt` per image. RETFound is fully unloaded from VRAM afterwards and never used during training.
 
 ---
 
-### Step 2 — Train the SegFormer Encoder
+### Step 2 — Phase 1: Train the SegFormer Encoder
 
 ```bash
 python -m classifier train --config classifier/config.yaml
 
-# Resume from a checkpoint
+# Resume from checkpoint
 python -m classifier train --config classifier/config.yaml \
-                           --resume checkpoints/classifier/epoch_0050.pt
+                           --resume checkpoints/classifier/epoch_0030.pt
 ```
 
-Trains for `training.epochs` epochs. Best checkpoint by val loss saved as `best.pt`.
+Trains for `training.epochs` epochs (default 60). Best checkpoint by validation loss saved as `best.pt`.
 
-**What to watch in the logs:**
-- `α` (gate scalar) should stabilise — too high means the gate is dominating
-- `β` ramps up after epoch 10 — `l_kl` will start increasing
-- `l_ortho` should decrease as class μ vectors become more orthogonal
-- `l_supcon` drives everything — if it stalls, check class balance
+**What to monitor:**
+
+| Metric | Healthy behaviour | Red flag |
+|--------|-----------------|----------|
+| `l_main` | Decreasing | Plateau early → check data loading |
+| `l_aux` | Decreasing | Stays high → VIB1 not learning; check retfound cache |
+| `l_kl1`, `l_kl2` | ~0 until epoch 10, then rises slightly | Exploding → reduce `beta_target` |
+| `val_loss` | Tracking train_loss with small gap | Diverging → increase `dropout` |
+| `β` | 0 for first 10 epochs, then linear ramp | — |
 
 ---
 
-### Step 3 — Extract Feature Vectors
+### Step 3 — Phase 2: Extract Feature Vectors
 
 ```bash
 python -m classifier extract --config classifier/config.yaml
+
+# Use specific checkpoint
+python -m classifier extract --config classifier/config.yaml \
+                             --checkpoint checkpoints/classifier/epoch_0045.pt
 ```
 
-Loads `best.pt`, runs every image through frozen encoder, concatenates RETFound embeddings, saves:
-
+Produces:
 ```
 features/
-├── train_features.npy   (N_train, 1793)
-├── train_labels.npy     (N_train,)
-├── train_stems.json
-├── val_features.npy     (N_val, 1793)
-├── val_labels.npy       (N_val,)
+├── train_features.npy    (N_train, 256)  float32  — 128 VIB1 ⊕ 128 VIB2
+├── train_labels.npy      (N_train, 3)    float32  multi-hot
+├── train_labels_int.npy  (N_train,)      int32    class index
+├── train_stems.json      list of image stems
+├── val_features.npy      (N_val,   256)
+├── val_labels.npy        (N_val,   3)
+├── val_labels_int.npy    (N_val,)
 └── val_stems.json
 ```
 
 ---
 
-### Step 4 — Train XGBoost
+### Step 4 — Phase 2: Train XGBoost Classifiers
 
 ```bash
+python -m classifier xgboost --config classifier/config.yaml
+
+# With SHAP feature importance
 python -m classifier xgboost --config classifier/config.yaml --shap
 ```
 
-Trains on 1793-D vectors with early stopping. Uses `tree_method=hist` for reliable GPU acceleration. Saves:
-- `xgboost_model.pkl` — the trained booster
-- `xgboost_results.json` — train/val metrics (accuracy, macro F1, AUC-ROC, confusion matrix)
-- `shap_importance.json` — top feature importances (if `--shap`)
+Trains 3 independent binary classifiers. Saves:
+```
+checkpoints/classifier/
+├── xgboost/
+│   ├── xgb_DR.pkl
+│   ├── xgb_Glaucoma.pkl
+│   └── xgb_PM.pkl
+├── xgboost_results.json     ← per-disease AUC, AP, accuracy
+└── shap/
+    ├── shap_DR.json
+    ├── shap_Glaucoma.json
+    └── shap_PM.json
+```
 
-**Feature name mapping in SHAP output:**
+**SHAP feature name mapping:**
 
-| Dimension range | Name prefix | Source |
-|---|---|---|
-| 0 – 383 | `segformer_pathA_XXX` | Path A raw context |
-| 384 – 767 | `segformer_vib_XXX` | Path B VIB μ |
-| 768 | `global_anomaly_score` | mean(clean residual) |
-| 769 – 1792 | `retfound_XXXX` | RETFound [CLS] embedding |
+| Dimension slice | Name prefix | Source |
+|----------------|-------------|--------|
+| `[0:128]` | `vib1_z_000` … `vib1_z_127` | Custom SegFormer heads (DR+Glauc+PM) |
+| `[128:256]` | `vib2_z_000` … `vib2_z_127` | RETFound stream |
 
 ---
 
-### Step 5 — Run Inference
+### Step 5 — Inference
+
+See [Section 22](#22-inference).
+
+---
+
+## 21. Classifier Configuration Reference
+
+```yaml
+# classifier/config.yaml — complete annotated reference
+
+paths:
+  data_dir:           "data/classifier"
+  anomaly_maps_dir:   "data/anomaly_maps"
+  checkpoint_dir:     "checkpoints/classifier"
+  features_dir:       "features"
+  retfound_cache_dir: "retfound_cache"
+  retfound_weights:   null          # path to .pth or null (HF fallback)
+
+data:
+  image_size: 512
+  mean: [0.485, 0.456, 0.406]       # ImageNet — RGB channels only
+  std:  [0.229, 0.224, 0.225]       # residual channels kept in [0,1]
+  num_workers: 4
+  pin_memory: true
+
+model:
+  backbone:     "nvidia/mit-b3"
+  head_out_dim: 256                 # each expert head output dim
+                                    # 3 × 256 = 768 → VIB1 input
+  vib_hidden:   256                 # VIB pre-projection hidden dim
+  vib_out_dim:  128                 # z₁ and z₂ each; z_fused = 256
+  dropout:      0.3
+
+training:
+  epochs:        60
+  batch_size:    8                  # safe on 20GB VRAM with AMP
+  lr:            1.0e-4             # head/VIB LR; backbone gets lr × 0.1
+  weight_decay:  1.0e-4
+  warmup_epochs: 5                  # LR scheduler linear warmup
+  grad_clip:     1.0
+  amp:           true               # bfloat16 on Ampere, float16 otherwise
+
+  lambda_aux:    0.4                # L_aux weight (anti-free-riding)
+  lambda_kl:     1.0                # KL pass-through (β is the main knob)
+
+  beta_warmup_epochs:  10           # β = 0 for first N epochs
+  beta_anneal_epochs:  20           # linear 0 → beta_target
+  beta_target:         0.001
+
+  save_every: 5
+  eval_every: 1
+
+retfound:
+  embed_dim:        1024
+  image_size:       224
+  cache_batch_size: 32
+
+xgboost:
+  n_estimators:          500
+  max_depth:             6
+  learning_rate:         0.05
+  subsample:             0.8
+  colsample_bytree:      0.8
+  min_child_weight:      3
+  gamma:                 0.1
+  reg_alpha:             0.1        # L1 regularisation
+  reg_lambda:            1.0        # L2 regularisation
+  early_stopping_rounds: 50
+  seed:                  42
+  device:                "cuda"
+  tree_method:           "hist"     # required for GPU tree building
+
+classes:
+  names: ["DR", "Glaucoma", "PM"]
+```
+
+---
+
+## 22. Inference
+
+### CLI — Single Image
 
 ```bash
 python -m classifier infer \
@@ -807,89 +1018,108 @@ python -m classifier infer \
 
 Output:
 ```
-══════════════════════════════════════════════════
+════════════════════════════════════════════════════
   DIAGNOSIS:  DR
-  CONFIDENCE:
-    DR          92.4%  ████████████████████████████████████████
-    Glaucoma     5.9%  ██
-    PM           1.7%
-  Vector dim: (1793,)
-══════════════════════════════════════════════════
+  PROBABILITIES (independent per disease):
+    DR          87.3%  ████████████████████████████████████
+    Glaucoma    12.1%  ████
+    PM           4.8%  █
+  Vector dim: (256,)
+════════════════════════════════════════════════════
 ```
 
-> If no anomaly map is available, omit `--anomaly`. The gate defaults to identity.
+> Probabilities are **independent** — they do NOT sum to 1. DR=87% and Glaucoma=12% simultaneously is valid (comorbidity).
 
----
-
-## Classifier Configuration Reference
-
-```yaml
-training:
-  epochs:      100
-  batch_size:  16
-  lr:          1.0e-4        # head LR; backbone gets lr × 0.1
-  weight_decay: 1.0e-4
-  warmup_epochs: 5
-  grad_clip:   1.0
-  amp:         true          # bfloat16 on Ampere+, float16 otherwise
-
-  supcon_weight:  1.0        # SupCon drives everything
-  lambda_kl:      1.0        # pass-through — β is the sole VIB knob
-  lambda_ortho:   0.1        # Orthogonal penalty weight
-
-  supcon_temperatures:
-    0: 0.07                  # DR
-    1: 0.07                  # Glaucoma
-    2: 0.04                  # PM (minority → sharper gradient)
-
-  beta_warmup_epochs: 10     # β=0 for first N epochs
-  beta_anneal_epochs: 20     # linear ramp to beta_target
-  beta_target:       0.001   # true empirical bottleneck weight
-
-  save_every: 5
-  eval_every: 1
-
-xgboost:
-  n_estimators:  1000
-  max_depth:     6
-  learning_rate: 0.05
-  subsample:     0.8
-  colsample_bytree: 0.8
-  tree_method:   "hist"      # required for reliable GPU tree building
-  device:        "cuda"
-  early_stopping_rounds: 50
-```
-
----
-
-## Running Tests
+### Without Anomaly Map
 
 ```bash
-# All tests (no GPU, no downloads)
+python -m classifier infer --config classifier/config.yaml --image patient_001.jpg
+```
+Residual channels default to zeros.
+
+### On-the-Fly RETFound (no cache)
+
+```bash
+python -m classifier infer --config classifier/config.yaml \
+                           --image patient_001.jpg \
+                           --load-retfound
+```
+
+### Python API
+
+```python
+from classifier import NetrAiInference
+from classifier.utils import load_config
+
+cfg    = load_config("classifier/config.yaml")
+engine = NetrAiInference(cfg)
+
+result = engine.predict("patient.jpg", "patient_anomaly.png")
+# {
+#     "diagnosis":     "DR",
+#     "probabilities": {"DR": 0.873, "Glaucoma": 0.121, "PM": 0.048},
+#     "vector_256":    np.ndarray (256,)
+# }
+
+# Batch inference
+results = engine.predict_batch(
+    image_paths   = ["img1.jpg", "img2.jpg"],
+    anomaly_paths = ["img1_anom.png", "img2_anom.png"],
+)
+```
+
+---
+
+## 23. Key Hyperparameter Decisions
+
+| Hyperparameter | Value | Why |
+|---------------|-------|-----|
+| `batch_size` | 8 | Safe on 20GB VRAM with AMP. |
+| `lr` (heads) | 1e-4 | Standard for new layers on pretrained backbone. |
+| `lr` (backbone) | 1e-5 | 10× lower to preserve pretrained MIT-B3. |
+| `head_out_dim` | 256 | Wide enough for complex features, narrow enough to avoid redundancy per head. |
+| `vib_out_dim` | 128 | Compresses 768-D (VIB1) by 6× and 1024-D (VIB2) by 8×. z_fused = 256. |
+| `lambda_aux` | 0.4 | 40% weight — forces VIB1 to learn without dominating L_main. |
+| `beta_target` | 0.001 | Mild bottleneck. Higher β causes posterior collapse. 0.001 compresses without killing. |
+| `beta_warmup` | 10 epochs | Classifiers need ~10 epochs to establish initial clusters before compression. |
+| `dropout` | 0.3 | Applied in expert head FC layers. Appropriate for medical imaging with small datasets. |
+| `n_estimators` | 500 | Sufficient for 256-D tabular input with early stopping at 50 rounds. |
+| `colsample_bytree` | 0.8 | 80% feature subsampling — key regulariser for 256 medical features. |
+
+---
+
+## 24. Feature Dimensions Reference
+
+| Tensor | Source | Shape |
+|--------|--------|-------|
+| `six_ch[:, 0:3]` | RGB image (ImageNet-normalised) | (B, 3, 512, 512) |
+| `six_ch[:, 3:6]` | Clean residual ×3 (diffusion model output) | (B, 3, 512, 512) |
+| `hidden[0]` | MIT-B3 Stage 1 | (B, 64, 128, 128) |
+| `hidden[2]` | MIT-B3 Stage 3 | (B, 320, 32, 32) |
+| `hidden[3]` | MIT-B3 Stage 4 | (B, 512, 16, 16) |
+| `dr_feat` | DRHead output | (B, 256) |
+| `glauc_feat` | GlaucHead output | (B, 256) |
+| `pm_feat` | PMHead output | (B, 256) |
+| `fused_768` | `cat([dr, glauc, pm])` | (B, 768) |
+| `retfound_emb` | Pre-cached RETFound [CLS] | (B, 1024) |
+| `z₁` | VIB1 sample | (B, 128) |
+| `z₂` | VIB2 sample | (B, 128) |
+| `z_fused` | `cat([z₁, z₂])` | (B, 256) |
+| `features.npy[:, 0:128]` | VIB1 μ — custom heads stream | (N, 128) |
+| `features.npy[:, 128:256]` | VIB2 μ — RETFound stream | (N, 128) |
+
+---
+
+## 25. Running Tests
+
+```bash
+# Full test suite (no GPU, no model downloads required)
 pytest classifier/tests/ -v
 
-# Individual suites
-pytest classifier/tests/test_losses.py -v
+# Individual modules
 pytest classifier/tests/test_model.py  -v
+pytest classifier/tests/test_losses.py -v
 pytest classifier/tests/test_data.py   -v
 ```
 
-All tests use a temporary dummy dataset and mock encoders — no real images or model downloads required.
-
----
-
-## Key Design Decisions — Classifier
-
-| Decision | Rationale |
-|---|---|
-| No CE head during SegFormer training | SupCon alone forces better-separated clusters than CE+SupCon |
-| `lambda_kl = 1.0` (pass-through) | β via BetaScheduler is the sole VIB knob — matches Alemi et al. 2017. The old `0.01` caused double-scaling: effective weight was `0.00001` |
-| Ortho penalty on μ only, not full 769-D | Path A must remain free to capture subtle early-stage signals |
-| VIB inference uses μ, not z | Deterministic embeddings → stable XGBoost decision boundaries |
-| Collision-safe RETFound cache keys | `{split}_{class}_{stem}.pt` prevents train/val name collision when datasets share filenames |
-| `torch.set_grad_enabled` as context manager | Guarantees global grad state is restored even if validation throws an exception |
-| `(features * 0).sum()` for zero losses | Graph-connected zero — prevents `None` gradients when SupCon or Ortho have no valid pairs |
-| RETFound cached before training | Never occupies VRAM during training; 1024-D domain context always available |
-| XGBoost over MLP | Tabular supremacy, column sampling overfitting resistance, SHAP explainability |
-| `tree_method=hist` | Only tree method that reliably uses GPU with `device=cuda` in XGBoost 2.0+ |
-| `WeightedRandomSampler` + class-aware τ | Two complementary fixes for class imbalance at hardware and math level |
+All tests use a temporary dummy dataset and toy model shapes. No real images, no pretrained downloads, no CUDA required.

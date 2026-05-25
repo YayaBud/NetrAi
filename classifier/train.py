@@ -1,11 +1,17 @@
 """
-NetrAi Classifier — SegFormer Training Loop
-=============================================
-Trains NetrAiEncoder using:
-  L_total = L_SupCon(1.0) + λ_kl · L_KL(β) + λ_ortho · L_Ortho
+NetrAi Classifier — SegFormer Training Loop (v2)
+==================================================
+Phase 1 differentiable training.
 
-No cross-entropy head — SupCon is the sole supervisory signal.
-XGBoost handles final classification after this training phase.
+Loss:
+    L_total = L_main + λ_aux · L_aux + β · (KL₁ + KL₂)
+
+    L_main   BCEWithLogitsLoss — main_classifier(z_fused) vs label_vec
+    L_aux    BCEWithLogitsLoss — aux_classifier(z1) vs label_vec
+    KL₁ + KL₂ — dual VIB bottleneck penalty with β-annealing
+
+After training: aux_classifier and main_classifier are discarded.
+The frozen encoder extracts 256-D vectors for XGBoost (Phase 2).
 
 Run:
     python -m classifier train --config classifier/config.yaml
@@ -13,7 +19,6 @@ Run:
 
 import os
 import argparse
-import yaml
 import logging
 from pathlib import Path
 
@@ -41,7 +46,7 @@ from .utils   import (
 
 class Trainer:
     """
-    Encapsulates the full SegFormer training loop.
+    Encapsulates Phase 1 training loop.
 
     Usage:
         trainer = Trainer(cfg)
@@ -56,11 +61,8 @@ class Trainer:
         self.amp_type = get_amp_dtype(self.device)
         self.use_amp  = cfg['training']['amp'] and self.device.type == "cuda"
 
-        # Directories
         self.ckpt_dir = cfg['paths']['checkpoint_dir']
         os.makedirs(self.ckpt_dir, exist_ok=True)
-
-        # Save a copy of config next to the checkpoints
         save_config(cfg, os.path.join(self.ckpt_dir, "config.yaml"))
 
         self._build_model()
@@ -68,8 +70,8 @@ class Trainer:
         self._build_optimiser()
         self._build_loss()
 
-        self.scaler        = GradScaler('cuda', enabled=self.use_amp)
-        self.metrics_log   = MetricsLogger(
+        self.scaler      = GradScaler('cuda', enabled=self.use_amp)
+        self.metrics_log = MetricsLogger(
             os.path.join(self.ckpt_dir, "metrics.json")
         )
         self.start_epoch   = 0
@@ -82,57 +84,69 @@ class Trainer:
     def _build_model(self):
         mc = self.cfg['model']
         self.model = NetrAiEncoder(
-            backbone_name     = mc['backbone'],
-            decoder_embed_dim = mc['decoder_embed_dim'],
-            path_a_dim        = mc['path_a_dim'],
-            path_b_dim        = mc['path_b_dim'],
-            alpha_init        = mc['alpha_init'],
+            backbone_name = mc['backbone'],
+            head_out_dim  = mc['head_out_dim'],
+            vib_hidden    = mc['vib_hidden'],
+            vib_out_dim   = mc['vib_out_dim'],
+            dropout       = mc.get('dropout', 0.3),
         ).to(self.device)
 
-        n_params = sum(p.numel() for p in self.model.parameters())
-        self.logger.info(f"Model: NetrAiEncoder  params={n_params / 1e6:.1f}M")
-        self.logger.info(f"  Learned gate α init = {mc['alpha_init']}")
+        n_train = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        self.logger.info(f"Model: NetrAiEncoder  trainable={n_train / 1e6:.1f}M")
 
     def _build_data(self):
         p  = self.cfg['paths']
         dc = self.cfg['data']
         tc = self.cfg['training']
 
+        shared = dict(
+            anomaly_dir        = p['anomaly_maps_dir'],
+            retfound_cache_dir = p.get('retfound_cache_dir'),
+            image_size         = dc['image_size'],
+            batch_size         = tc['batch_size'],
+            num_workers        = dc['num_workers'],
+            pin_memory         = dc['pin_memory'],
+        )
+
         self.train_loader = build_dataloader(
-            root        = os.path.join(p['data_dir'], "train"),
-            anomaly_dir = p['anomaly_maps_dir'],
-            image_size  = dc['image_size'],
-            batch_size  = tc['batch_size'],
-            augment     = True,
-            balanced    = True,   # WeightedRandomSampler — 1:1:1 per batch
-            num_workers = dc['num_workers'],
-            pin_memory  = dc['pin_memory'],
-            drop_last   = True,
+            root     = os.path.join(p['data_dir'], "train"),
+            split    = "train",
+            augment  = True,
+            balanced = True,
+            drop_last = True,
+            **shared,
         )
         self.val_loader = build_dataloader(
-            root        = os.path.join(p['data_dir'], "val"),
-            anomaly_dir = p['anomaly_maps_dir'],
-            image_size  = dc['image_size'],
-            batch_size  = tc['batch_size'],
-            augment     = False,
-            balanced    = False,  # sequential — every sample exactly once
-            num_workers = dc['num_workers'],
-            pin_memory  = dc['pin_memory'],
-            drop_last   = False,
+            root     = os.path.join(p['data_dir'], "val"),
+            split    = "val",
+            augment  = False,
+            balanced = False,
+            drop_last = False,
+            **shared,
         )
 
     def _build_optimiser(self):
         tc = self.cfg['training']
-        # Use different LR for backbone vs. custom heads
+
+        # Pretrained MIT-B3 backbone → small LR to preserve pretrained weights
+        # The 6-ch patch_embed proj is inside encoder.parameters() — it gets the
+        # same small LR initially, which is fine (it starts at zero contribution).
         encoder_params = list(self.model.encoder.parameters())
-        head_params    = (
-            list(self.model.decoder.parameters())
-            + list(self.model.gate.parameters())
-            + list(self.model.bottleneck.parameters())
+
+        # Everything else → higher LR (new layers, learn from scratch)
+        new_params = (
+            list(self.model.dr_head.parameters())
+            + list(self.model.glauc_head.parameters())
+            + list(self.model.pm_head.parameters())
+            + list(self.model.vib1.parameters())
+            + list(self.model.vib2.parameters())
+            + list(self.model.aux_classifier.parameters())
+            + list(self.model.main_classifier.parameters())
         )
+
         self.optimiser = torch.optim.AdamW([
-            {"params": encoder_params, "lr": tc['lr'] * 0.1},  # 10× lower for pretrained backbone
-            {"params": head_params,    "lr": tc['lr']},
+            {"params": encoder_params, "lr": tc['lr'] * 0.1},   # 10× lower
+            {"params": new_params,     "lr": tc['lr']},
         ], weight_decay=tc['weight_decay'])
 
         self.scheduler = LinearWarmupCosineScheduler(
@@ -151,33 +165,40 @@ class Trainer:
     def resume(self, ckpt_path: str):
         self.logger.info(f"Resuming from {ckpt_path}")
         ckpt = load_checkpoint(ckpt_path, self.model, self.optimiser, self.device)
-        self.start_epoch = ckpt.get("epoch", 0) + 1
+        self.start_epoch   = ckpt.get("epoch", 0) + 1
         self.best_val_loss = ckpt.get("best_val_loss", float("inf"))
         if "scheduler_state" in ckpt:
             self.scheduler.load_state_dict(ckpt["scheduler_state"])
         self.logger.info(f"  Resumed at epoch {self.start_epoch}")
 
     # ------------------------------------------------------------------
-    # Training / validation steps
+    # Training / validation step
     # ------------------------------------------------------------------
 
     def _run_epoch(self, loader, epoch: int, train: bool) -> dict:
         self.model.train(train)
 
         meters = {k: AverageMeter(k)
-                  for k in ("loss", "l_supcon", "l_kl", "l_ortho")}
+                  for k in ("loss", "l_main", "l_aux", "l_kl1", "l_kl2", "l_kl")}
         tc = self.cfg['training']
 
         with torch.set_grad_enabled(train):
             for batch in loader:
-                images     = batch["image"].to(self.device, non_blocking=True)
-                amap       = batch["anomaly_map"].to(self.device, non_blocking=True)
-                labels     = batch["label"].to(self.device, non_blocking=True)
+                six_ch       = batch["six_ch"].to(self.device,  non_blocking=True)
+                retfound_emb = batch["retfound_emb"].to(self.device, non_blocking=True)
+                label_vec    = batch["label_vec"].to(self.device, non_blocking=True)
 
                 with autocast('cuda', dtype=self.amp_type, enabled=self.use_amp):
-                    vector_769, mu, log_var = self.model(images, amap)
-                    loss, breakdown        = self.criterion(
-                        vector_769, mu, log_var, labels, epoch
+                    z_fused, z1, mu1, log_var1, mu2, log_var2 = self.model(
+                        six_ch, retfound_emb
+                    )
+                    aux_logits  = self.model.aux_classifier(z1)
+                    main_logits = self.model.main_classifier(z_fused)
+
+                    loss, breakdown = self.criterion(
+                        main_logits, aux_logits,
+                        mu1, log_var1, mu2, log_var2,
+                        label_vec, epoch,
                     )
 
                 if train:
@@ -190,9 +211,10 @@ class Trainer:
                     self.scaler.step(self.optimiser)
                     self.scaler.update()
 
-                B = images.size(0)
+                B = six_ch.size(0)
                 for k in meters:
-                    meters[k].update(breakdown[k], n=B)
+                    if k in breakdown:
+                        meters[k].update(breakdown[k], n=B)
 
         return {k: m.avg for k, m in meters.items()}
 
@@ -204,12 +226,13 @@ class Trainer:
         tc    = self.cfg['training']
         timer = Timer()
         self.logger.info(
-            f"Training for {tc['epochs']} epochs  "
-            f"AMP={'on' if self.use_amp else 'off'}  "
+            f"Phase 1 training for {tc['epochs']} epochs | "
+            f"AMP={'on' if self.use_amp else 'off'} | "
             f"device={self.device}"
         )
 
         for epoch in range(self.start_epoch, tc['epochs']):
+
             # ---- Train ----
             train_metrics = self._run_epoch(self.train_loader, epoch, train=True)
             self.scheduler.step()
@@ -220,33 +243,32 @@ class Trainer:
                 val_metrics = self._run_epoch(self.val_loader, epoch, train=False)
 
             # ---- Logging ----
-            lr = self.optimiser.param_groups[1]['lr']  # head LR
+            lr = self.optimiser.param_groups[1]['lr']   # head LR
             self.logger.info(
                 f"Epoch {epoch+1:03d}/{tc['epochs']} | "
                 f"lr={lr:.2e} | "
                 f"β={self.criterion.beta_sched.get_beta(epoch):.5f} | "
-                f"α={self.model.gate.alpha.item():.4f} | "
                 f"train_loss={train_metrics['loss']:.4f} "
-                f"SupCon={train_metrics['l_supcon']:.4f} "
-                f"KL={train_metrics['l_kl']:.4f} "
-                f"Ortho={train_metrics['l_ortho']:.4f}"
+                f"main={train_metrics['l_main']:.4f} "
+                f"aux={train_metrics['l_aux']:.4f} "
+                f"kl1={train_metrics['l_kl1']:.4f} "
+                f"kl2={train_metrics['l_kl2']:.4f}"
                 + (f" | val_loss={val_metrics.get('loss', 0):.4f}"
                    if val_metrics else "")
-                + f" | elapsed={timer.elapsed()}"
+                + f" | {timer.elapsed()}"
             )
 
             log_entry = {
-                "epoch":    epoch + 1,
-                "lr":       lr,
+                "epoch": epoch + 1,
+                "lr":    lr,
                 **{f"train_{k}": v for k, v in train_metrics.items()},
                 **{f"val_{k}":   v for k, v in val_metrics.items()},
-                "alpha":    float(self.model.gate.alpha.item()),
-                "beta":     self.criterion.beta_sched.get_beta(epoch),
+                "beta":  self.criterion.beta_sched.get_beta(epoch),
             }
             self.metrics_log.log(log_entry)
 
             # ---- Checkpoint ----
-            is_best = False
+            is_best  = False
             val_loss = val_metrics.get("loss", float("inf"))
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
@@ -254,29 +276,33 @@ class Trainer:
 
             if (epoch + 1) % tc['save_every'] == 0 or is_best:
                 state = {
-                    "epoch":            epoch,
-                    "model_state":      self.model.state_dict(),
-                    "optimizer_state":  self.optimiser.state_dict(),
-                    "scheduler_state":  self.scheduler.state_dict(),
-                    "best_val_loss":    self.best_val_loss,
-                    "config":           self.cfg,
+                    "epoch":           epoch,
+                    "model_state":     self.model.state_dict(),
+                    "optimizer_state": self.optimiser.state_dict(),
+                    "scheduler_state": self.scheduler.state_dict(),
+                    "best_val_loss":   self.best_val_loss,
+                    "config":          self.cfg,
                 }
                 fname = f"epoch_{epoch+1:04d}.pt"
                 path  = save_checkpoint(
                     state, self.ckpt_dir, filename=fname, is_best=is_best
                 )
                 if is_best:
-                    self.logger.info(f"  ★ New best val_loss={self.best_val_loss:.4f} → {path}")
+                    self.logger.info(
+                        f"  ★ New best val_loss={self.best_val_loss:.4f} → {path}"
+                    )
 
-        self.logger.info(f"Training complete. Best val_loss={self.best_val_loss:.4f}")
+        self.logger.info(
+            f"Phase 1 training complete. Best val_loss={self.best_val_loss:.4f}"
+        )
 
 
 # ---------------------------------------------------------------------------
-# CLI entry point  (python -m classifier train ...)
+# CLI entry point
 # ---------------------------------------------------------------------------
 
 def main(args=None):
-    parser = argparse.ArgumentParser(description="Train NetrAi SegFormer encoder")
+    parser = argparse.ArgumentParser(description="Phase 1: Train NetrAi SegFormer encoder")
     parser.add_argument("--config",  default="classifier/config.yaml")
     parser.add_argument("--resume",  default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--log-dir", default=None, help="Override log directory")

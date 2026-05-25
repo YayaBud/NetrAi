@@ -1,123 +1,33 @@
 """
-NetrAi Classifier — Loss Functions
-=====================================
-Three losses, applied during SegFormer training:
+NetrAi Classifier — Loss Functions (v2)
+=========================================
+Three losses, applied during Phase 1 differentiable training:
 
-  L_total = L_SupCon(1.0) + λ_kl · L_KL(β) + λ_ortho · L_Ortho
+    L_total = L_main + λ_aux · L_aux + β · (KL₁ + KL₂)
 
-L_SupCon  — Supervised Contrastive Loss (class-aware temperature)
-              Applied to: full 769-D vector
-L_KL      — VIB KL divergence with β-annealing
-              Applied to: Path B  μ, log_var
-L_Ortho   — Orthogonal Feature Projection (cosine similarity penalty)
-              Applied to: Path B  μ ONLY (Path A stays untouched)
+L_main   — BCEWithLogitsLoss on main_classifier(z_fused) vs label_vec
+              Multi-label: 3 independent binary signals, one per disease.
+              Applied to the full fused 256-D path.
+
+L_aux    — BCEWithLogitsLoss on aux_classifier(z1) vs label_vec
+              Forces VIB1 to independently encode disease signal from the
+              custom SegFormer heads. WITHOUT this, VIB1 collapses to N(0,I)
+              and the optimizer free-rides entirely on the frozen RETFound
+              stream (VIB2).
+
+KL₁ + KL₂ — Dual VIB KL divergence with β-annealing.
+              Compresses each stream independently.
+              β is annealed 0 → β_target over training to prevent the
+              bottleneck from collapsing before the classifiers converge.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
 
 
 # ---------------------------------------------------------------------------
-# 1. Supervised Contrastive Loss  (class-aware temperature)
-# ---------------------------------------------------------------------------
-
-class SupConLoss(nn.Module):
-    """
-    Supervised Contrastive Loss (Khosla et al., 2020) with per-class
-    temperature to handle class imbalance without aggressive oversampling.
-
-    Standard formulation:
-        L_i = -1/|P(i)| · Σ_{p∈P(i)}  log [
-            exp(z_i·z_p / τ_i)
-            ──────────────────────────────────
-            Σ_{a≠i} exp(z_i·z_a / τ_i)
-        ]
-
-    τ_i = class_temperatures[label_i].  Lower τ → sharper penalty →
-    minority class errors are punished more.
-
-    Args:
-        class_temperatures  dict  {class_idx: float}
-                            e.g. {0: 0.07, 1: 0.07, 2: 0.04}
-        base_temperature    float  normalisation constant (keeps loss scale
-                                   comparable across temperature values)
-    """
-
-    def __init__(
-        self,
-        class_temperatures: dict,
-        base_temperature:   float = 0.07,
-    ):
-        super().__init__()
-        self.class_temperatures = class_temperatures
-        self.base_temperature   = base_temperature
-
-    def forward(
-        self,
-        features: torch.Tensor,   # (B, D) — the 769-D vectors (L2-normalised inside)
-        labels:   torch.Tensor,   # (B,)   — integer class indices
-    ) -> torch.Tensor:
-        """
-        Returns scalar SupCon loss.
-        """
-        device = features.device
-        B      = features.shape[0]
-
-        if B < 2:
-            # Return zero loss connected to the computation graph
-            # so backward() doesn't produce None gradients
-            return (features * 0).sum()
-
-        # L2 normalise features onto the unit hypersphere
-        z = F.normalize(features, dim=1)              # (B, D)
-
-        # Build per-sample temperature vector
-        tau = torch.tensor(
-            [self.class_temperatures.get(int(lbl.item()), 0.07) for lbl in labels],
-            dtype=torch.float32, device=device,
-        )                                              # (B,)
-
-        # Pairwise cosine similarity matrix, scaled by per-sample τ
-        # sim[i,j] = z_i · z_j / τ_i
-        sim = torch.mm(z, z.T)                        # (B, B)
-        sim = sim / tau.unsqueeze(1)                  # broadcast τ_i over columns
-
-        # Mask out the diagonal (self-similarity)
-        eye  = torch.eye(B, dtype=torch.bool, device=device)
-        sim  = sim.masked_fill(eye, float('-inf'))
-
-        # Log-sum-exp denominator (all pairs except self)
-        log_denom = torch.logsumexp(sim, dim=1)       # (B,)
-
-        # Positive mask: same class, different index
-        labels_col = labels.unsqueeze(1)
-        labels_row = labels.unsqueeze(0)
-        pos_mask   = (labels_row == labels_col) & ~eye  # (B, B)
-
-        # Count positives per anchor
-        n_pos = pos_mask.sum(dim=1).float()            # (B,)
-        # Anchors with no positive pair contribute zero
-        valid = n_pos > 0
-
-        if not valid.any():
-            return (features * 0).sum()
-
-        # Sum log-probabilities over positives
-        log_prob = sim - log_denom.unsqueeze(1)        # (B, B)
-        loss_per_anchor = -(pos_mask.float() * log_prob).sum(dim=1)  # (B,)
-
-        # Normalise by |P(i)| and base_temperature factor
-        loss_per_anchor = loss_per_anchor / n_pos.clamp(min=1)
-        loss_per_anchor = loss_per_anchor * (self.base_temperature / tau)
-
-        loss = loss_per_anchor[valid].mean()
-        return loss
-
-
-# ---------------------------------------------------------------------------
-# 2. VIB KL Divergence Loss
+# 1. VIB KL Divergence Loss
 # ---------------------------------------------------------------------------
 
 def vib_kl_loss(
@@ -126,87 +36,37 @@ def vib_kl_loss(
     beta:    float = 1.0,
 ) -> torch.Tensor:
     """
-    KL divergence between N(μ, σ²) and N(0, I), scaled by β.
+    KL divergence between N(μ, σ²) and the prior N(0, I), scaled by β.
 
-        L_KL = β · mean( -½ · Σ_d (1 + log σ²_d - μ²_d - σ²_d) )
+        KL = -½ · Σ_d (1 + log σ²_d - μ²_d - σ²_d)
 
-    β is annealed from 0 → β_target during training (see BetaScheduler).
-    When β=0 the VIB path is unconstrained; as β rises the bottleneck
-    forces Path B to discard noisy features and keep only the strongest
-    disease signal in μ.
+    β is annealed from 0 → β_target over training (see BetaScheduler).
+    Starting at β=0 lets the classifiers establish meaningful clusters
+    before the bottleneck starts compressing, preventing premature collapse.
+
+    Applied separately to VIB1 and VIB2 — each stream must justify
+    its own compression budget.
     """
     kl = -0.5 * (1.0 + log_var - mu.pow(2) - log_var.exp())
     return beta * kl.mean()
 
 
 # ---------------------------------------------------------------------------
-# 3. Orthogonal Feature Projection (applied to μ only)
-# ---------------------------------------------------------------------------
-
-def orthogonal_loss(
-    mu:          torch.Tensor,   # (B, 384) — VIB mean vectors only
-    labels:      torch.Tensor,   # (B,)
-    num_classes: int = 3,
-    eps:         float = 1e-8,
-) -> torch.Tensor:
-    """
-    Cosine similarity penalty between class-mean μ vectors.
-
-    Forces Path B to learn maximally distinct (non-overlapping) features
-    for each disease class.  NOT applied to Path A (raw context preserved).
-
-        L_Ortho = Σ_{i<j}  |cos(μ_centroid_i, μ_centroid_j)|
-
-    When L_Ortho → 0, all class centroids are orthogonal in the embedding
-    space → XGBoost sees maximally separable clusters.
-    """
-    device = mu.device
-
-    # Compute class centroids
-    centroids = []
-    for c in range(num_classes):
-        mask = (labels == c)
-        if mask.sum() == 0:
-            # No samples for this class in the batch — use zero centroid
-            centroids.append(torch.zeros(mu.shape[1], device=device))
-        else:
-            centroids.append(mu[mask].mean(dim=0))
-
-    loss = (mu * 0).sum()   # graph-connected zero
-    n_pairs = 0
-
-    for i in range(num_classes):
-        for j in range(i + 1, num_classes):
-            ci = centroids[i]
-            cj = centroids[j]
-
-            # Only penalise if both centroids are non-zero (both classes in batch)
-            if ci.norm() < eps or cj.norm() < eps:
-                continue
-
-            cos_sim = F.cosine_similarity(
-                ci.unsqueeze(0), cj.unsqueeze(0)
-            ).abs()
-            loss    = loss + cos_sim
-            n_pairs += 1
-
-    return loss / max(n_pairs, 1)
-
-
-# ---------------------------------------------------------------------------
-# 4. β-Annealing Scheduler
+# 2. β-Annealing Scheduler
 # ---------------------------------------------------------------------------
 
 class BetaScheduler:
     """
-    Controls VIB β during training:
+    Controls the VIB KL penalty weight β during training.
 
-        Epochs [0,  warmup)                → β = 0
-        Epochs [warmup, warmup + anneal)   → β linearly ramps 0 → β_target
-        Epochs [warmup + anneal, ∞)        → β = β_target
+        Epochs [0, warmup)                  → β = 0
+        Epochs [warmup, warmup + anneal)    → β linearly ramps 0 → β_target
+        Epochs [warmup + anneal, ∞)         → β = β_target (constant)
 
-    This ensures SupCon establishes initial clusters BEFORE the bottleneck
-    starts compressing, preventing early collapse to N(0, I).
+    The warmup phase ensures the BCEWithLogitsLoss classifiers establish
+    useful disease-separating features BEFORE the bottleneck compresses
+    anything. Starting with high β causes posterior collapse in epoch 1
+    because collapsing to N(0,I) immediately drops the KL term to zero.
     """
 
     def __init__(
@@ -223,74 +83,122 @@ class BetaScheduler:
         """epoch is 0-indexed."""
         if epoch < self.warmup:
             return 0.0
-        prog = min(epoch - self.warmup, self.anneal) / self.anneal
+        prog = min(epoch - self.warmup, self.anneal) / max(self.anneal, 1)
         return float(prog * self.target)
 
 
 # ---------------------------------------------------------------------------
-# 5. Combined Loss
+# 3. Combined Loss
 # ---------------------------------------------------------------------------
 
 class NetrAiLoss(nn.Module):
     """
-    Wraps all three losses into a single callable.
+    Wraps all losses for Phase 1 training.
 
     Usage:
         criterion = NetrAiLoss(cfg)
-        loss, breakdown = criterion(vector_769, mu, log_var, labels, epoch)
+        loss, breakdown = criterion(
+            main_logits, aux_logits,
+            mu1, log_var1, mu2, log_var2,
+            label_vec, epoch
+        )
+
+    Args:
+        main_logits  (B, 3)  — from main_classifier(z_fused)
+        aux_logits   (B, 3)  — from aux_classifier(z1)
+        mu1          (B, 128) — VIB1 mean
+        log_var1     (B, 128) — VIB1 log σ²
+        mu2          (B, 128) — VIB2 mean
+        log_var2     (B, 128) — VIB2 log σ²
+        label_vec    (B, 3)  — multi-hot float [dr, glauc, pm] ∈ {0.0, 1.0}
+        epoch        int     — current epoch (0-indexed) for β scheduler
     """
 
     def __init__(self, cfg: dict):
         super().__init__()
         tc = cfg['training']
-        cc = cfg['classes']
 
-        class_temps = {
-            cc['DR']:       tc['supcon_temperatures'][0],
-            cc['Glaucoma']: tc['supcon_temperatures'][1],
-            cc['PM']:       tc['supcon_temperatures'][2],
-        }
+        self.bce = nn.BCEWithLogitsLoss()   # multi-label: reduction='mean' over all B×3 elements
 
-        self.supcon    = SupConLoss(
-            class_temperatures=class_temps,
-            base_temperature=tc['supcon_base_temperature'],
+        self.beta_sched  = BetaScheduler(
+            warmup_epochs = tc['beta_warmup_epochs'],
+            anneal_epochs = tc['beta_anneal_epochs'],
+            beta_target   = tc['beta_target'],
         )
-        self.beta_sched = BetaScheduler(
-            warmup_epochs=tc['beta_warmup_epochs'],
-            anneal_epochs=tc['beta_anneal_epochs'],
-            beta_target=tc['beta_target'],
-        )
-        self.lambda_kl    = tc['lambda_kl']
-        self.lambda_ortho = tc['lambda_ortho']
-        self.supcon_w     = tc['supcon_weight']
-        self.num_classes  = len(cc['names'])
+
+        self.lambda_aux = tc['lambda_aux']
+        self.lambda_kl  = tc['lambda_kl']
 
     def forward(
         self,
-        vector_769: torch.Tensor,   # (B, 769)
-        mu:         torch.Tensor,   # (B, 384)
-        log_var:    torch.Tensor,   # (B, 384)
-        labels:     torch.Tensor,   # (B,)
-        epoch:      int,
+        main_logits: torch.Tensor,   # (B, 3)
+        aux_logits:  torch.Tensor,   # (B, 3)
+        mu1:         torch.Tensor,   # (B, 128)
+        log_var1:    torch.Tensor,   # (B, 128)
+        mu2:         torch.Tensor,   # (B, 128)
+        log_var2:    torch.Tensor,   # (B, 128)
+        label_vec:   torch.Tensor,   # (B, 3) float multi-hot
+        epoch:       int,
     ) -> tuple[torch.Tensor, dict]:
 
         beta = self.beta_sched.get_beta(epoch)
 
-        l_supcon = self.supcon(vector_769, labels)
-        l_kl     = vib_kl_loss(mu, log_var, beta=beta)
-        l_ortho  = orthogonal_loss(mu, labels, num_classes=self.num_classes)
+        # Multi-label BCE losses
+        l_main = self.bce(main_logits, label_vec)
+        l_aux  = self.bce(aux_logits,  label_vec)
 
-        total = (
-            self.supcon_w     * l_supcon
-            + self.lambda_kl  * l_kl
-            + self.lambda_ortho * l_ortho
-        )
+        # Dual KL penalties
+        l_kl1  = vib_kl_loss(mu1, log_var1, beta=1.0)   # β applied via scalar below
+        l_kl2  = vib_kl_loss(mu2, log_var2, beta=1.0)
+        l_kl   = beta * self.lambda_kl * (l_kl1 + l_kl2)
+
+        total = l_main + self.lambda_aux * l_aux + l_kl
 
         breakdown = {
-            'loss':       total.item(),
-            'l_supcon':   l_supcon.item(),
-            'l_kl':       l_kl.item(),
-            'l_ortho':    l_ortho.item(),
-            'beta':       beta,
+            'loss':    total.item(),
+            'l_main':  l_main.item(),
+            'l_aux':   l_aux.item(),
+            'l_kl1':   l_kl1.item(),
+            'l_kl2':   l_kl2.item(),
+            'l_kl':    l_kl.item(),
+            'beta':    beta,
         }
         return total, breakdown
+
+
+# ---------------------------------------------------------------------------
+# Quick sanity check
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    cfg = {
+        'training': {
+            'lambda_aux':          0.4,
+            'lambda_kl':           1.0,
+            'beta_warmup_epochs':  10,
+            'beta_anneal_epochs':  20,
+            'beta_target':         0.001,
+        }
+    }
+    criterion = NetrAiLoss(cfg)
+    B = 4
+
+    main_logits = torch.randn(B, 3)
+    aux_logits  = torch.randn(B, 3)
+    mu1         = torch.randn(B, 128)
+    lv1         = torch.randn(B, 128)
+    mu2         = torch.randn(B, 128)
+    lv2         = torch.randn(B, 128)
+    labels      = torch.zeros(B, 3)
+    labels[torch.arange(B), torch.randint(0, 3, (B,))] = 1.0   # one-hot
+
+    # β=0 during warmup
+    loss, bd = criterion(main_logits, aux_logits, mu1, lv1, mu2, lv2, labels, epoch=5)
+    assert bd['beta'] == 0.0
+    print(f"epoch=5  loss={bd['loss']:.4f}  β={bd['beta']:.5f}  ✓ (KL should be 0)")
+
+    # β>0 after warmup
+    loss, bd = criterion(main_logits, aux_logits, mu1, lv1, mu2, lv2, labels, epoch=20)
+    assert bd['beta'] > 0.0
+    print(f"epoch=20 loss={bd['loss']:.4f}  β={bd['beta']:.5f}  ✓")
+
+    print("losses.py — all checks passed ✓")

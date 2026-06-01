@@ -106,7 +106,8 @@ def get_linear_weight(tile_size=TILE_SIZE, device='cpu'):
 
 def make_retinal_mask(images):
     """
-    Intensity-based Retinal Mask (Foreground only, no artificial circular cropping)
+    Intensity-based Retinal Mask WITH artificial circular cropping.
+    Circular crop is required to remove edge artifacts from tiling borders.
     """
     B, C, H, W = images.shape
     device = images.device
@@ -115,10 +116,20 @@ def make_retinal_mask(images):
     img_01 = (images.float() + 1.0) / 2.0
     
     # 2. Pixel-by-pixel intensity check (The Foreground)
-    # This automatically matches the natural shape of the retina.
     fg = 1.0 - (img_01.mean(dim=1, keepdim=True) < 0.05).float()
     
-    return fg
+    # 3. Circular crop
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+    cy, cx = H // 2, W // 2
+    r = min(H, W) // 2
+    circle = (((yy - cy)**2 + (xx - cx)**2) <= r**2).float()
+    circle = circle.unsqueeze(0).unsqueeze(0)
+    
+    return fg * circle
 
 # -----------------------------------------------------------------------------
 # 4. MULTIDIFFUSION DDIM INFERENCE

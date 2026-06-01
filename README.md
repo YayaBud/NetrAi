@@ -49,6 +49,8 @@
 
 NetrAI frames retinal anomaly detection as a **reconstruction problem**. A DDPM/DDIM diffusion UNet is trained exclusively on healthy retinal images. At inference, a test image is partially noised (SDEdit, `T_start < 1000`) and reconstructed. The residual between the original and reconstruction is the anomaly map — lesions the model never saw during training produce high residual signal.
 
+**The forward process as an eraser:** When a diseased image (e.g., containing a haemorrhage) is fed into the DDPM forward process, the added noise mathematically destroys the disease signal. The UNet is then instructed (via the 768-d RETFound conditioning vector) to reconstruct a *healthy* version of that eye. Because the disease was erased by the noise and the UNet only knows how to draw healthy retinas, it simply fails to redraw the lesion. Subtracting the reconstruction from the original leaves only what the UNet could not account for — the disease.
+
 The primary evaluation metric is **pixel-level AUROC on the DDR and iDRiD datasets** (757 annotated fundus images with MA/HE/EX/SE lesion masks), measured via vessel-suppressed residual maps (Frangi filter post-processing).
 
 ---
@@ -96,6 +98,27 @@ UNet2DConditionModel (diffusers)
         |
         ▼ (inference only)
 MultiDiffusion Tiling (9 overlapping 256×256 tiles @ stride=128, over 512×512)
+
+### Why `block_out_channels: (128, 256, 512, 512)`?
+
+The channel count doubles at each down-block to compensate for shrinking spatial resolution — when the image is half the size, you need twice the channels to preserve information capacity. The progression caps at **512 instead of doubling to 1024** purely for VRAM reasons: a 1024-channel layer would quadruple the parameter count and activation memory, crashing a 24GB GPU at `batch_size=6`. Repeating 512 twice gives the bottleneck an extra "thinking layer" at maximum depth without exceeding memory limits.
+
+### Inside a `CrossAttnUpBlock2D`
+
+Each Up Block is an assembly line that runs its ResNet+Attention pair **twice** before upsampling:
+
+```
+For i in [1, 2]:  ← two iterations
+    hidden = ResNet(hidden, time_embedding)         # pixel refinement, clock-aware
+    hidden = SpatialTransformer(hidden):            # read the 768-d instructions
+        → Self-Attention  (each pixel attends to all other pixels in the tile)
+        → Cross-Attention (each pixel attends to the 768-d RETFound vector)
+hidden = Upsampler(hidden)                         # bilinear 2× spatial upscale
+```
+
+- **Self-Attention** ensures spatial coherence — blood vessels flow continuously across the tile.
+- **Cross-Attention** injects the healthy-eye blueprint at every spatial position. This is the step where the 768-d conditioning vector *actively guides* what the UNet draws.
+- Running the loop **twice** doubles the model's refinement capacity at that resolution without the memory cost of adding a third full block.
         |
         ▼
 Reconstruction (512×512)
@@ -338,6 +361,8 @@ eval:
 | Decision | Rationale |
 |----------|-----------|
 | Train on 256px tiles, infer on 512px via MultiDiffusion | UNet fits in VRAM at 256px; MultiDiffusion fuses overlapping tiles for seamless 512px output |
+| `T_start=300` not `T_start=1000` | At t=1000 the image is pure noise — coarse retinal structure (optic disc position, vessel layout) is completely destroyed, forcing the UNet to hallucinate anatomy from scratch. At t=300, the noise is strong enough to erase small lesions (MA, HE) but the UNet can still see the global eye shape through the noise, producing a reconstruction that preserves anatomy while removing pathology. |
+| `block_out_channels: (128, 256, 512, 512)` — cap at 512 | Doubling to 1024 at the bottleneck would quadruple parameter + activation memory, exceeding 24GB VRAM at the target batch size. Repeating 512 instead gives an extra deep reasoning layer at maximum compression depth with no additional memory cost. |
 | Frozen RETFound ViT-Large | RETFound captures fundus-specific anatomy; fine-tuning would destroy the generic healthy-retina prior |
 | Cache raw ViT features, not proj MLP outputs | Proj MLP trains, so caching its output would cause stale gradients across iterations |
 | SNR-γ=2.0 (aggressive) | Paired with LCW: prevents the model from overfitting tile boundary micro-textures at low noise |

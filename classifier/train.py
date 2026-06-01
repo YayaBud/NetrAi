@@ -91,8 +91,53 @@ class Trainer:
             dropout       = mc.get('dropout', 0.3),
         ).to(self.device)
 
+        # Optionally freeze early backbone stages to prevent overfitting on small data.
+        # Must be called BEFORE _build_optimiser so frozen params are excluded.
+        n_freeze = self.cfg['training'].get('freeze_backbone_stages', 0)
+        if n_freeze > 0:
+            self._freeze_backbone_stages(n_freeze)
+
         n_train = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        self.logger.info(f"Model: NetrAiEncoder  trainable={n_train / 1e6:.1f}M")
+        n_total = sum(p.numel() for p in self.model.parameters())
+        self.logger.info(
+            f"Model: NetrAiEncoder  trainable={n_train/1e6:.1f}M / {n_total/1e6:.1f}M total"
+            + (f"  (MIT-B3 stages 0-{n_freeze-1} frozen)" if n_freeze else "")
+        )
+
+    def _freeze_backbone_stages(self, n_stages: int) -> None:
+        """
+        Freeze the first n_stages of the MIT-B3 SegFormer encoder.
+
+        MIT-B3 structure inside self.model.encoder.encoder (SegformerEncoder):
+            patch_embeddings  — ModuleList[4], one overlap-patch-embed per stage
+            block             — ModuleList[4], transformer blocks per stage
+            layer_norm        — ModuleList[4], LN after each stage
+
+        Rule: patch_embeddings[0].proj stays TRAINABLE even when stage 0 is
+        frozen, because it was surgically modified to accept 6 channels and
+        channels 3-5 (residual) are zero-init and need to learn from scratch.
+        Freezing it would permanently silence the anomaly-map input.
+        """
+        enc = self.model.encoder.encoder   # SegformerEncoder
+        n_stages = min(n_stages, 4)        # MIT-B3 has 4 stages
+
+        for i in range(n_stages):
+            # Freeze transformer blocks
+            for param in enc.block[i].parameters():
+                param.requires_grad_(False)
+            # Freeze per-stage layer norm
+            for param in enc.layer_norm[i].parameters():
+                param.requires_grad_(False)
+            # Freeze patch embedding for stages 1+ only.
+            # Stage 0 patch_embed was modified for 6-ch — must stay trainable.
+            if i > 0:
+                for param in enc.patch_embeddings[i].parameters():
+                    param.requires_grad_(False)
+
+        self.logger.info(
+            f"  Froze MIT-B3 stages 0..{n_stages-1} "
+            f"(patch_embeddings[0].proj kept trainable for 6-ch residual input)"
+        )
 
     def _build_data(self):
         p  = self.cfg['paths']
@@ -128,10 +173,12 @@ class Trainer:
     def _build_optimiser(self):
         tc = self.cfg['training']
 
-        # Pretrained MIT-B3 backbone → small LR to preserve pretrained weights
-        # The 6-ch patch_embed proj is inside encoder.parameters() — it gets the
-        # same small LR initially, which is fine (it starts at zero contribution).
-        encoder_params = list(self.model.encoder.parameters())
+        # Filter to trainable-only params — frozen stages must be excluded here.
+        # If frozen params are added to AdamW, it wastes optimizer state memory
+        # and can interfere with gradient scaling under AMP.
+        encoder_params = [
+            p for p in self.model.encoder.parameters() if p.requires_grad
+        ]
 
         # Everything else → higher LR (new layers, learn from scratch)
         new_params = (
@@ -143,10 +190,12 @@ class Trainer:
             + list(self.model.aux_classifier.parameters())
             + list(self.model.main_classifier.parameters())
         )
+        # Expert heads and VIBs are always new — no requires_grad filter needed.
+        # (They are never frozen.)
 
         self.optimiser = torch.optim.AdamW([
-            {"params": encoder_params, "lr": tc['lr'] * 0.1},   # 10× lower
-            {"params": new_params,     "lr": tc['lr']},
+            {"params": encoder_params, "lr": tc['lr'] * 0.1},   # 10× lower for backbone
+            {"params": new_params,     "lr": tc['lr']},          # full LR for heads+VIBs
         ], weight_decay=tc['weight_decay'])
 
         self.scheduler = LinearWarmupCosineScheduler(
@@ -223,26 +272,29 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def train(self):
-        tc    = self.cfg['training']
-        timer = Timer()
+        tc      = self.cfg['training']
+        timer   = Timer()
+        patience = tc.get('early_stop_patience', 0)   # 0 = disabled
+        patience_ctr = 0
+
         self.logger.info(
-            f"Phase 1 training for {tc['epochs']} epochs | "
-            f"AMP={'on' if self.use_amp else 'off'} | "
-            f"device={self.device}"
+            f"Phase 1 training | max_epochs={tc['epochs']} | "
+            f"early_stop_patience={patience or 'off'} | "
+            f"AMP={'on' if self.use_amp else 'off'} | device={self.device}"
         )
 
         for epoch in range(self.start_epoch, tc['epochs']):
 
-            # ---- Train ----
+            # ── Train ──────────────────────────────────────────────────────
             train_metrics = self._run_epoch(self.train_loader, epoch, train=True)
             self.scheduler.step()
 
-            # ---- Validate ----
+            # ── Validate ───────────────────────────────────────────────────
             val_metrics = {}
             if (epoch + 1) % tc['eval_every'] == 0:
                 val_metrics = self._run_epoch(self.val_loader, epoch, train=False)
 
-            # ---- Logging ----
+            # ── Logging ────────────────────────────────────────────────────
             lr = self.optimiser.param_groups[1]['lr']   # head LR
             self.logger.info(
                 f"Epoch {epoch+1:03d}/{tc['epochs']} | "
@@ -253,26 +305,34 @@ class Trainer:
                 f"aux={train_metrics['l_aux']:.4f} "
                 f"kl1={train_metrics['l_kl1']:.4f} "
                 f"kl2={train_metrics['l_kl2']:.4f}"
-                + (f" | val_loss={val_metrics.get('loss', 0):.4f}"
+                + (f" | val_loss={val_metrics.get('loss', 0):.4f}  "
+                   f"patience={patience_ctr}/{patience}"
+                   if val_metrics and patience else
+                   f" | val_loss={val_metrics.get('loss', 0):.4f}"
                    if val_metrics else "")
                 + f" | {timer.elapsed()}"
             )
 
             log_entry = {
-                "epoch": epoch + 1,
-                "lr":    lr,
+                "epoch":          epoch + 1,
+                "lr":             lr,
+                "patience_ctr":   patience_ctr,
                 **{f"train_{k}": v for k, v in train_metrics.items()},
                 **{f"val_{k}":   v for k, v in val_metrics.items()},
-                "beta":  self.criterion.beta_sched.get_beta(epoch),
+                "beta":           self.criterion.beta_sched.get_beta(epoch),
             }
             self.metrics_log.log(log_entry)
 
-            # ---- Checkpoint ----
+            # ── Checkpoint + early stopping ────────────────────────────────
             is_best  = False
             val_loss = val_metrics.get("loss", float("inf"))
+
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
-                is_best = True
+                is_best  = True
+                patience_ctr = 0          # improvement → reset counter
+            elif val_metrics:             # only count stagnation on eval epochs
+                patience_ctr += 1
 
             if (epoch + 1) % tc['save_every'] == 0 or is_best:
                 state = {
@@ -292,8 +352,18 @@ class Trainer:
                         f"  ★ New best val_loss={self.best_val_loss:.4f} → {path}"
                     )
 
+            # ── Early stopping check ───────────────────────────────────────
+            if patience > 0 and patience_ctr >= patience:
+                self.logger.info(
+                    f"\n  ⏹  Early stopping triggered at epoch {epoch+1} — "
+                    f"val_loss did not improve for {patience} consecutive eval epochs.\n"
+                    f"  Best val_loss={self.best_val_loss:.4f} (saved as best.pt)"
+                )
+                break
+
         self.logger.info(
-            f"Phase 1 training complete. Best val_loss={self.best_val_loss:.4f}"
+            f"Phase 1 complete after {epoch+1} epoch(s). "
+            f"Best val_loss={self.best_val_loss:.4f}"
         )
 
 

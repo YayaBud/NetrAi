@@ -1,4 +1,4 @@
-# NetrAI — Retinal Intelligence System
+# NetrAD: Domain-Agnostic Retinal Anomaly Detection via Multi-Scale Diffusion
 
 > A two-stage retinal analysis system: a **diffusion model** for unsupervised lesion detection, feeding into a **dual-stream classifier** for disease identification (DR / Glaucoma / PM).
 >
@@ -47,7 +47,7 @@
 
 ## 1. Overview
 
-NetrAI frames retinal anomaly detection as a **reconstruction problem**. A DDPM/DDIM diffusion UNet is trained exclusively on healthy retinal images. At inference, a test image is partially noised (SDEdit, `T_start < 1000`) and reconstructed. The residual between the original and reconstruction is the anomaly map — lesions the model never saw during training produce high residual signal.
+NetrAD frames retinal anomaly detection as a **reconstruction problem**. A DDPM/DDIM diffusion UNet is trained exclusively on healthy retinal images. At inference, a test image is partially noised (SDEdit, `T_start < 1000`) and reconstructed. The residual between the original and reconstruction is the anomaly map — lesions the model never saw during training produce high residual signal.
 
 **The forward process as an eraser:** When a diseased image (e.g., containing a haemorrhage) is fed into the DDPM forward process, the added noise mathematically destroys the disease signal. The UNet is then instructed (via the 768-d RETFound conditioning vector) to reconstruct a *healthy* version of that eye. Because the disease was erased by the noise and the UNet only knows how to draw healthy retinas, it simply fails to redraw the lesion. Subtracting the reconstruction from the original leaves only what the UNet could not account for — the disease.
 

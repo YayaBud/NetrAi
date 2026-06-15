@@ -17,7 +17,7 @@ def generate_simplex_noise(shape, device, frequency=8, octaves=4):
 
 def add_simplex_noise(x, timesteps, alphas_cumprod, frequency=8, octaves=4):
     """Standard DDPM forward process with Gaussian noise."""
-    device = x.device
+    device = x.devicelcw
     ac     = alphas_cumprod[timesteps].float().view(-1, 1, 1, 1)
     noise  = torch.randn_like(x.float())
     return ac.sqrt() * x.float() + (1 - ac).sqrt() * noise, noise
@@ -227,7 +227,6 @@ def multidiffusion_reconstruct_full(img_512, path, model, cached_cond,
 # -----------------------------------------------------------------------------
 
 MULTISCALE_SIZES   = [256, 128, 64]
-MULTISCALE_WEIGHTS = [0.5, 0.3, 0.2]
 
 
 @torch.no_grad()

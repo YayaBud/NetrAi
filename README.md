@@ -57,35 +57,53 @@ The primary evaluation metric is **pixel-level AUROC on the DDR and iDRiD datase
 
 ## 2. Training Dataset
 
-The model is trained exclusively on **22,104 healthy fundus images** from 6 public sources:
+The model is trained on **67,318 healthy fundus images** (residing in [`diffusionV2/`](file:///d:/NetrAi/diffusionV2)), with a **~3,366-image healthy validation hold-out** carved at 5% / seed 42 by [`carve_val.py`](file:///d:/NetrAi/diffusionV2/carve_val.py). Images are pooled from 10 public sources — only **disease-screening-negative ("grade-0" / healthy)** subsets are used.
 
-| Source | Count | % of Total |
-|--------|-------|-----------|
-| EyePACS | 13,500 | 61.1% |
-| DDR | 5,241 | 23.7% |
-| APTOS | 1,625 | 7.4% |
-| REFUGE2 | 1,080 | 4.9% |
-| MESSIDOR-2 | 630 | 2.9% |
-| STARE | 28 | 0.1% |
-| **Total** | **22,104** | **100%** |
+### Per-Source Breakdown
 
-Only grade-0 (no diabetic retinopathy) images are used from graded datasets. The model never sees lesion-bearing images during training — anomaly detection at inference relies entirely on reconstruction error against this healthy prior.
+| Source | Images (n) | Tier | Notes |
+|--------|-----------|------|-------|
+| **eyepacs** | 25,808 | Bulk | Grade-0 subset; dominant volume — defines the healthy manifold |
+| **airogs** | 20,000 | Bulk | Glaucoma-screened; large camera/illumination diversity |
+| **eddfs** | 15,000 | Bulk | Multi-centre screening cohort |
+| **odir** | 2,160 | Mid | Ocular Disease Intelligent Recognition; multi-label, healthy subset only |
+| **aptos** | 1,606 | Mid | Grade-0 DR screening; varied camera/pigmentation |
+| **messidor** | 1,017 | Mid | Messidor-2 grade-0; three-site camera diversity |
+| **g1020** | 724 | Long tail | Glaucoma-screened; optic disc–centered crops |
+| **origa** | 482 | Long tail | Glaucoma-screened; high-res disc imaging |
+| **refuge2** | 360 | Long tail | Glaucoma challenge; disc-centred, high-quality |
+| **palm** | 161 | Long tail | Pathological myopia challenge; rare staphyloma morphology |
+| **Total** | **67,318** | — | Train ≈ 63,952 · Val ≈ 3,366 (5% / seed 42) |
+
+### Domain Tier Summary
+
+| Tier | Sources | Share | Role |
+|------|---------|-------|------|
+| Bulk (~90%) | EyePACS, AIROGS, EDDFS | ~60,808 images | Define the healthy manifold |
+| Mid | ODIR, APTOS, Messidor-2 | ~4,783 images | Camera / illumination / pigmentation diversity |
+| Long tail | G1020, ORIGA, REFUGE2, PALM | ~1,727 images | Rare-domain coverage; disc-centred morphology |
+
+**Domain imbalance is corrected, not ignored.** A `sqrt`-frequency `WeightedRandomSampler` ([`data.make_domain_sampler`](file:///d:/NetrAi/diffusionV2/data.py)) reweights each sample by `1/√(domain_count)` — softening the head (EyePACS/AIROGS/EDDFS) without over-boosting tiny domains (PALM = 161 would otherwise get a ~400× draw rate and overfit).
+
+> **Label-purity caveat:** "healthy" means *screening-negative for that source's target disease*. Glaucoma-screened sources (AIROGS, ORIGA, REFUGE2, G1020) were never screened for **DR**, so a residual fraction may carry DR lesions and mildly contaminate DR detection. Bulk-volume sources dominate the manifold and dilute this.
+
+The model never sees lesion-bearing **DDR / iDRiD** images during training — those are **held out** for pixel-level evaluation. Anomaly detection relies entirely on reconstruction error against this healthy prior.
 
 ---
 
 ## 3. Diffusion Architecture
 
 ```
-Input (512×512 fundus image)
+Input (768×768 fundus image)
         |
         ▼
 RETFoundConditioner ──► Frozen ViT-Large (224px, ImageNet-normalized)
         |                       |
         |               1024-d class token
         |                       |
-        |               proj MLP (1024+768→768, GELU + LayerNorm)
+        |               proj MLP: Linear(1024→768) → GELU → Linear(768→768) → LayerNorm
         |                       |
-        |               cross_attention_dim=768 conditioning vector
+        |               cross_attention_dim=768 conditioning vector → [B, 1, 768]
         |
         ▼
 UNet2DConditionModel (diffusers)
@@ -97,7 +115,8 @@ UNet2DConditionModel (diffusers)
   └── cross_attention_dim: 768
         |
         ▼ (inference only)
-MultiDiffusion Tiling (9 overlapping 256×256 tiles @ stride=128, over 512×512)
+MultiDiffusion Tiling (16 overlapping 256×256 tiles @ stride=170 ≈ 33%, over 768×768)
+  + A-LCW learned gate (per-tile, per-step local/global conditioning mix)
 
 ### Why `block_out_channels: (128, 256, 512, 512)`?
 
@@ -121,13 +140,13 @@ hidden = Upsampler(hidden)                         # bilinear 2× spatial upscal
 - Running the loop **twice** doubles the model's refinement capacity at that resolution without the memory cost of adding a third full block.
         |
         ▼
-Reconstruction (512×512)
+Reconstruction (768×768)
         |
         ▼
-Residual Map ──► Retinal Ellipse Mask ──► Frangi Vessel Suppression
+Residual Map ──► Circular FOV Mask ──► Frangi vessel suppression ──► per-image MAD-z
         |
         ▼
-Anomaly Score (pixel-level, used for DDR AUROC)
+Anomaly Score (pixel-level, used for DDR / iDRiD AUROC)
         |
         ▼
      [Feed to Classifier — Part II]
@@ -141,11 +160,12 @@ Anomaly Score (pixel-level, used for DDR AUROC)
 
 `	ext
 train.py (Orchestrator)
-  |-- data.py       (collate_fn passes paths alongside tensors for cache keys)
-  |-- models.py     (LRU _vit_cache wiped at end of epoch to prevent stale gradients)
-  |-- diffusion.py  (Provides TILE_VIEWS, alphas_cumprod, and make_retinal_mask)
-  |-- evaluation.py (Vessel suppression via Frangi)
-  +-- sweep.py      (Loads best_loss.pt and sweeps LCW/t_start combinations)
+  |-- data.py       (collate_fn passes paths alongside tensors for cache keys;
+  |                  make_domain_sampler builds the sqrt-freq WeightedRandomSampler)
+  |-- models.py     (RETFoundConditioner + proj + A-LCW LCWGate; Disk/LRU feature cache)
+  |-- diffusion.py  (Provides TILE_VIEWS (16), alphas_cumprod, make_retinal_mask, recon)
+  |-- losses.py     (Min-SNR MSE + L1/FFL hybrid)
+  +-- evaluation.py (DDR/iDRiD metrics; vessel-suppressed MAD-z postprocess)
 `
 
 ### `train.py`
@@ -153,56 +173,59 @@ train.py (Orchestrator)
 The orchestration hub. Reads `config.yaml`, builds all components, and runs the training loop.
 
 **Key responsibilities:**
-- Parses all config sections (`paths`, `training`, `diffusion`, `eval`, `sweep`) into local variables.
+- Parses config sections (`paths`, `training`, `diffusion`, `eval`) into local variables.
 - Sets CUDA environment flags: `expandable_segments`, TF32, cuDNN benchmark.
-- Builds the UNet (`UNet2DConditionModel` from diffusers) with channels-last memory format and gradient checkpointing enabled.
-- Builds `RETFoundConditioner` + `CachedConditioner`.
-- Attempts `torch.compile(model, mode="default")` and falls back gracefully.
-- Enables xformers **only when compile is inactive** (compile + xformers causes attention processor cache thrash).
-- Constructs two-group AdamW optimizer (separate LRs for UNet and conditioner projection MLP).
-- Handles three checkpoint loading scenarios:
-  - i. Resume from `last.pt` (full state including optimizer/scaler/scheduler)
-  - ii. Warm-start from a 256px checkpoint (loads weights, resets LR to 30% base)
-  - iii. Train from scratch
+- Builds the UNet (`UNet2DConditionModel`, `sample_size=256`) in channels-last layout. Gradient checkpointing is **off** by default (VRAM headroom confirmed → ~25% throughput gain); xformers memory-efficient attention is **on**.
+- Builds `RETFoundConditioner` → `CachedConditioner` (in-memory LRU) → `DiskCachedConditioner` (persistent **pre-projection** `[1,1024]` feature cache).
+- `torch.compile` is **off** by default — reduce-overhead cudagraphs collide with the xformers `flash_bwd` custom op under per-tile sequential backward.
+- Constructs a **three-group** AdamW optimizer: UNet @ `lr_unet`, proj MLP @ `lr_conditioner`, **A-LCW gate** @ `lr_conditioner` (fused when available, `weight_decay=1e-4`).
+- Maintains EMA (decay 0.999) over UNet + proj + A-LCW gate.
+- Handles three checkpoint scenarios:
+  - i. Resume from `last.pt` (full state: model, proj, gate, optimizer, scaler, scheduler, EMA, best metrics).
+  - ii. **Warm-start from a 256px checkpoint** — loads UNet + proj weights, scales base LR to **30%**, forces `warmup_epochs = 1`.
+  - iii. Train from scratch.
 
-**Training loop per epoch:**
-- Randomly samples `NUM_TRAIN_TILES` tiles per image during training (not all 9) to keep iteration time reasonable.
-- Computes `lcw` (Local Conditioning Weight) via a cosine schedule over the entire training run — zero at step 0, rising to `MAX_TRAIN_LCW` by the final step.
-- Mixed-precision forward pass with `autocast` (bfloat16 if supported, else float16).
-- `diffusion_loss` = 0.6 × SNR-weighted MSE + 0.4 × L1/Focal-Frequency hybrid.
-- Gradient accumulation over `ACCUM_STEPS` micro-batches, then `clip_grad_norm(1.0)`.
-- Cosine LR schedule with linear warmup.
-- Periodic: validation SSIM/PSNR, DDR AUROC eval, visualization saves, CSV logging.
-- Saves: `last.pt`, `best_loss.pt`, `best_auroc.pt`, `loss.csv`, `metrics.csv`, `ddr_metrics.csv`.
+**Training loop per step (memory-safe two-phase):**
+- Samples `NUM_TRAIN_TILES` **random** tile views per image (not all 16) to keep iteration time low.
+- **Phase 1** — one batched (no-grad) RETFound forward over all sampled tiles; then, *per tile*, `proj` is applied live (independent autograd graph) and the **A-LCW gate** predicts the local/global mix; `blended = lcw·local + (1−lcw)·global` (global cond detached).
+- **Phase 2** — per-tile UNet forward → `diffusion_loss` → **immediate backward**, freeing that tile's activations before the next. Peak VRAM = **one** tile's forward+backward, *independent of tile count*.
+- `diffusion_loss` = 0.6 × Min-SNR MSE + 0.4 × (L1 + FFL) hybrid, under `autocast` (bf16 if supported).
+- Gradient accumulation over `ACCUM_STEPS` micro-batches → `clip_grad_norm(1.0)` → `optimizer.step()`.
+- `CosineAnnealingLR` (`T_max = epochs − warmup`, `eta_min=1e-7`) after linear warmup.
+- Periodic: val SSIM/PSNR, **DDR/iDRiD AUROC** eval (OOM-guarded — skips and continues training on CUDA OOM), visualization saves, CSV logging.
+- Saves: `last.pt`, `best_loss.pt` (lowest val loss), `best_auroc.pt` (highest DDR AUROC), `loss.csv`, `metrics.csv`, `ddr_metrics.csv`.
 
-**LCW Schedule:**
+**A-LCW (Adaptive Local Conditioning Weight).** The old fixed cosine LCW schedule is **replaced** by a learned gate (`models.LCWGate`): a small MLP that, per tile and per denoising step, predicts how much to trust the tile's *local* conditioning vs the whole-image *global* conditioning:
+
 ```
-LCW(step) = MAX_TRAIN_LCW × 0.5 × (1 - cos(π × (current_step / total_train_steps)))
+lcw       = sigmoid( MLP([ global_cond, local_cond, t_ratio ]) )  ∈ (0, 1)
+tile_cond = lcw · local_cond + (1 − lcw) · global_cond
 ```
-During inference, LCW scales down linearly with timestep: `dynamic_lcw = max_lcw × (1 - t/1000)`, giving global conditioning dominance at high noise and local tile conditioning at low noise.
+
+`max_train_lcw` in config is **no longer used in training** — it survives only as an inference fallback for old checkpoints that lack `lcw_gate` weights.
 
 ---
 
 ### `models.py`
 
+#### `LCWGate` (A-LCW)
+
+Small MLP gate — the core of **Adaptive Local Conditioning Weight**. Input `[global_cond, local_cond, t_ratio]`; output a per-tile, per-step scalar in `(0,1)` broadcast over the conditioning channels: `lcw = σ(MLP(...))`. Trained live (own LR group, EMA, checkpoint). Replaces the old hand-tuned cosine LCW schedule.
+
 #### `RETFoundConditioner`
 
-Wraps a frozen RETFound ViT-Large (via `timm`) with a trainable projection MLP.
+Frozen RETFound ViT-Large backbone + a small **trainable** projection head and the A-LCW gate.
 
-- Loads `RETFound_cfp_weights.pth` from a configurable path (falls back to torchvision ViT-L if timm is unavailable).
-- ViT parameters are frozen (`requires_grad_(False)`) and kept in `eval()` permanently — `train()` override ensures only the projection MLP ever enters training mode.
-- Input preprocessing: bicubic resize to 224×224 → revert from diffusion `[-1,1]` to `[0,1]` → ImageNet normalize.
-- Output: `(B, 1, 768)` cross-attention conditioning tensor.
-- ImageNet mean/std registered as **buffers** (no per-call tensor allocation).
+- Loads `RETFound_cfp_weights.pth` (falls back to torchvision ViT-L if unavailable). ViT params frozen (`requires_grad_(False)`), permanently in `eval()`; the `train()` override keeps only `proj` + `lcw_gate` trainable.
+- `proj`: `Linear(1024→768) → GELU → Linear(768→768) → LayerNorm`, output `(B, 1, 768)`.
+- Preprocessing: resize to 224×224 → `[-1,1]`→`[0,1]` → ImageNet normalize (mean/std as buffers).
+- `extract_features()` returns the raw `[B, 1024]` CLS token; **projection is applied live each step** so `proj` receives gradients from the per-tile local path.
 
-#### `CachedConditioner`
+#### `CachedConditioner` → `DiskCachedConditioner`
 
-A stateful wrapper around `RETFoundConditioner` that caches raw ViT features (not proj MLP outputs) in an `OrderedDict` LRU cache (max 500 entries).
-
-- Cache key: `(image_path, "full")` or `(image_path, tile_id)`.
-- LRU eviction via `move_to_end` / `popitem(last=False)`.
-- `get_full_image_cond(img, path)` — conditioning for a full 512px image.
-- `get_tile_conds_batched(img_512, tile_views)` — single batched ViT forward pass for all 9 tiles (eliminates 9 sequential ViT calls during inference).
+Two-layer feature cache around the conditioner:
+- **`CachedConditioner`** — in-memory `OrderedDict` LRU of raw ViT features (keyed by image path); `get_tile_conds_batched()` runs one batched ViT forward for all 16 tiles.
+- **`DiskCachedConditioner`** — persistent on-disk cache storing the **raw, pre-projection** `[1, 1024]` CLS token per image. Projection is applied on every call, decoupling the cache from the evolving `proj` weights. (Old post-projection caches froze a random epoch-0 projection; those `[…, 768]` files are rejected and recomputed.)
 
 ---
 
@@ -210,8 +233,7 @@ A stateful wrapper around `RETFoundConditioner` that caches raw ViT features (no
 
 All diffusion math, MultiDiffusion tiling, and the retinal mask.
 
-**Noise functions:**
-- `generate_simplex_noise` — `torch.randn`, shaped.
+**Noise functions** (names are legacy — noise is standard **Gaussian**; simplex was tested and rejected, so `simplex_freq`/`simplex_octaves` are no-ops):
 - `add_simplex_noise` — standard DDPM forward process: `x_t = √ā·x₀ + √(1-ā)·ε`.
 - `simplex_ddim_step` — DDIM reverse step with optional stochasticity (`eta`). Clamps `pred_x0` to `[-1,1]`.
 
@@ -220,31 +242,30 @@ All diffusion math, MultiDiffusion tiling, and the retinal mask.
 | Constant | Value | Notes |
 |----------|-------|-------|
 | `TILE_SIZE` | 256 | UNet input size |
-| `FULL_SIZE` | 512 | Full inference resolution |
-| `TILE_STRIDE` | 128 | 50% overlap |
-| `NUM_TRAIN_TILES` | 2 | Tiles sampled per image during training |
-| `TILE_VIEWS` | 9 tiles | Precomputed `(h0,h1,w0,w1)` coordinates |
+| `FULL_SIZE` | **768** | Full inference resolution |
+| `TILE_STRIDE` | **170** | ~33% overlap — minimum that hides seams → sharper residual |
+| `NUM_TRAIN_TILES` | 2 | Random tiles sampled per image **during training** |
+| `TILE_VIEWS` | **16** tiles | 4×4 grid via `_even_starts` → `[0,171,341,512]` per axis |
 
-- `make_linear_weight` — 2D pyramid weight for tile blending. Peaks at 1.0 in tile center, tapers to near-zero at edges, ensuring smooth seams. Cached per device (`_LINEAR_WEIGHT_CACHE`).
-- `make_retinal_mask` — Dynamic elliptical FOV mask: threshold < 0.05 as background → fit ellipse to FOV bounds → returns intersection of illuminated pixels and ellipse.
-- `multidiffusion_reconstruct` — Core inference loop: partially noise → DDIM denoising with per-tile UNet calls, fusing outputs via pyramid-weighted accumulation, with `dynamic_lcw` blending tile-specific and global conditioning.
-- `multiscale_residual` — Runs separate reconstructions at 256px, 128px, 64px → upscale all to 512px → element-wise **maximum** across scales (no weighted sum — avoids starving coarse scales).
+- `_even_starts` / `get_tile_views` — evenly spaced tile starts from `round(span/stride)+1` (avoids the degenerate 2px-apart edge pair the old fixed-stride logic produced).
+- `get_linear_weight` / `make_cosine_weight` — **cosine²** blend window (`sin²(x)+1e-3`). The wide high-weight plateau lets 33% overlap hide seams; the `1e-3` floor prevents zero-weight starvation at boundaries.
+- `make_retinal_mask` — **circular** FOV crop (`r = min(H,W)//2`) intersected with an intensity foreground mask (mean < 0.05 = background). Removes tiling border artifacts; assumes the fundus is centered (valid after direct Resize).
+- `multidiffusion_reconstruct` — core inference loop: partially noise → DDIM denoising with per-tile UNet calls, fusing outputs via cosine²-weighted accumulation, with the **A-LCW gate** blending tile-specific and global conditioning per step.
+- `full_reconstruct_and_residual` / `multiscale_residual` — multi-scale reconstruction → upscale to 768px → element-wise **maximum** across scales (max, not weighted sum — avoids starving coarse scales).
 
 ---
 
 ### `data.py`
 
-- `make_transform` — Builds torchvision transform pipeline. BILINEAR interpolation throughout (avoids bicubic ringing artifacts in L1 residuals).
-- Train augmentations: RandomResizedCrop (scale 0.8–1.0), RandomHorizontalFlip, RandomVerticalFlip, RandomRotation ±15°, ColorJitter (mild).
-- Val: CenterCrop only.
-
-`RetinaDataset` — Accepts three source types: `.csv` (with `path`/`image` column), `.txt` (newline-separated paths), or directory (recursive glob).
-
-Features:
-- Optional `bad_files_txt` to pre-filter known corrupted files.
-- Retry loop (up to 10 attempts) to skip unreadable images at runtime without crashing.
-- Returns `(tensor, path)` tuples — paths are used as cache keys in `CachedConditioner`.
-- `collate_fn` — Stacks tensors, keeps paths as a Python list (not tensor).
+- `make_transform` — torchvision pipeline, **BILINEAR** throughout (avoids bicubic ringing in the L1 residual). Augmentations are deliberately conservative for reconstruction-UAD (cranking colour would normalise lesion colour and hide exudates/haemorrhages):
+  - `Resize(crop_size)` — direct resize, **no** RandomResizedCrop (crop jitter breaks the path-keyed conditioning and the centered FOV mask).
+  - `RandomHorizontalFlip` — L/R-eye is anatomically valid; laterality invariance.
+  - `RandomAffine(±10°, scale 0.92–1.08)` — rotation + **±8% FOV/scale jitter** for the unseen DDR/iDRiD magnifications.
+  - `ColorJitter(0.2, 0.2, 0.15, 0.04)` — mild illumination / sensor / tint variation.
+  - **No** VerticalFlip (fundus is never acquired upside-down). Val: resize only.
+- `RetinaDataset` — accepts `.csv` (`path`/`image` column, optional `source` column), `.txt`, or a directory (recursive glob). Tracks `self.sources` parallel to `self.images`. Optional `bad_files_txt` pre-filter; a 10-try retry loop skips unreadable images at runtime. Returns `(tensor, path)` (path = cache key).
+- `make_domain_sampler` — builds the `sqrt`-frequency `WeightedRandomSampler` over the `source` column (weight ∝ `1/√(domain_count)`); returns `None` (→ uniform shuffle) if there is no source column or only one domain.
+- `collate_fn` — stacks tensors, keeps paths as a Python list.
 
 ---
 
@@ -272,15 +293,15 @@ total = 0.6 × snr_weighted_loss + 0.4 × l1_focal_frequency_loss
 
 ### `evaluation.py`
 
-`postprocess_residual` — Vessel-aware anomaly map cleaning pipeline:
-1. Raw L1 residual per pixel, median-subtracted (removes diffuse reconstruction haze).
-2. Light Gaussian blur (σ=0.5) to kill single-pixel noise.
-3. Frangi filter on green channel (σ=2–8, black ridges — vessel detection on input anatomy).
-4. Frangi filter on residual itself (σ=1–5, bright ridges — catches vessel-shaped model artifacts).
+`postprocess_residual` — vessel-aware anomaly-map cleaning pipeline:
+1. Raw L1 residual per pixel, retinal-mask gated, **median-subtracted** (removes diffuse imperfect-reconstruction haze).
+2. Light Gaussian blur (σ=0.5).
+3. Frangi on the **green channel** (σ=2–8, black ridges) → real vessel anatomy.
+4. Frangi on the **residual** (σ=1–5, bright ridges) → vessel-shaped reconstruction artifacts, **gated** by a dilated tolerance band off the green-channel vessel map — so ridge-shaped residual *away* from vessels (flame haemorrhages, NVD/NVE) is treated as lesion and survives.
 5. Combined vessel map → soft exponential suppression: `weight = exp(-1.5 × vessel_norm)`.
-6. Final retinal mask application + normalization to `[0,1]`.
+6. **Per-image MAD-z score** (`(x − median) / (1.4826·MAD)`, clipped at 0) for cross-image calibration, then re-masked.
 
-`compute_ddr_metrics` — Full DDR evaluation: glob all images, combine 4-lesion-type masks (MA/HE/EX/SE), run `multidiffusion_reconstruct_full` → `postprocess_residual`, compute pixel-level AUROC/AP/Dice. Supports time-budget and count-budget cutoffs.
+`compute_ddr_metrics` — pixel-level **DDR / iDRiD** evaluation: union the 4 lesion-type masks (MA/HE/EX/SE), reconstruct via MultiDiffusion → `postprocess_residual`, compute **AUROC / AP / Dice**. Supports count- and time-budget cutoffs; called from the training loop under an OOM guard.
 
 ---
 
@@ -302,14 +323,6 @@ total = 0.6 × snr_weighted_loss + 0.4 × l1_focal_frequency_loss
 
 ---
 
-### `sweep.py`
-
-`run_sweep` — Grid search over `T_start × DDIM_steps × max_lcw`. Saves per-combo reconstructions and vessel-suppressed residual heatmaps. Writes `sweep_metrics.csv` with SSIM, PSNR, residual mean/max, and wall-clock seconds per combo. Generates panel plots per image per LCW value.
-
-Activated via `sweep.enabled: true` in config — runs instead of training when set.
-
----
-
 ### `utils.py`
 
 - `strip_compile_prefix` — Strips `_orig_mod.` from state dicts saved under `torch.compile`.
@@ -325,44 +338,42 @@ Activated via `sweep.enabled: true` in config — runs instead of training when 
 
 ```yaml
 paths:
-  data_train:       # CSV/TXT/dir — healthy training images
-  data_val:         # CSV/TXT/dir — healthy validation images
+  data_train:       # CSV/TXT/dir — healthy training images (e.g. train_keep_768.csv)
+  data_val:         # CSV — healthy validation hold-out (carve_val.py output)
   bad_files_txt:    # Optional path list to pre-filter corrupted images
-  checkpoint_dir:   # Where to save checkpoints + logs
-  pretrained_256:   # Optional 256px warm-start checkpoint
-  ddr_images_dir:   # DDR evaluation image directory
-  ddr_masks_dir:    # DDR evaluation mask directory (MA/HE/EX/SE subdirs)
-  idrid_images_dir: # iDRiD evaluation image directory
-  idrid_masks_dir:  # iDRiD evaluation mask directory
+  checkpoint_dir:   # Where to save checkpoints + logs (e.g. checkpoints_768v5)
+  pretrained_256:   # 256px warm-start checkpoint (best_loss.pt)
+  feat_cache_dir:   # Persistent pre-projection RETFound feature cache
+  ddr_images_dir:   # DDR / iDRiD eval image directory
+  ddr_masks_dir:    # Eval mask directory (MA/HE/EX/SE subdirs)
   retfound_weights: # Path to RETFound_cfp_weights.pth
 
-sweep:
-  enabled:    false
-  t_starts:   [200, 250, 300, 350]
-  ddim_steps: [50]
-  lcw_values: [0.4]
-
 training:
-  crop_size:         512
-  epochs:            20
-  batch_size:        6
-  accum_steps:       6     # Effective batch = batch_size × accum_steps = 36
-  warmup_epochs:     3
-  lr_unet:           5e-6
-  lr_conditioner:    1e-5
-  snr_gamma:         2.0
+  seed:                   42
+  crop_size:              768
+  epochs:                 15      # warm-start fine-tune; detection sweet spot ~epoch 8–15
+  batch_size:             6
+  accum_steps:            6       # effective batch = 6 × 6 = 36
+  warmup_epochs:          3       # forced to 1 when warm-starting from 256px
+  num_train_tiles:        2       # random tiles/step (of 16)
+  lr_unet:                5.0e-6  # ×0.3 on warm-start
+  lr_conditioner:         1.0e-5  # proj + A-LCW gate; ×0.3 on warm-start
+  snr_gamma:              2.0
+  gradient_checkpointing: false   # off → ~25% throughput (VRAM headroom confirmed)
+  channels_last:          true    # NHWC Tensor Core layout
+  compile:                false   # off — cudagraphs collide with xformers flash_bwd
 
 diffusion:
   ddim_steps:       50
-  ddim_t_start:     300   # Partial noising depth for SDEdit
-  max_train_lcw:    0.4   # Peak local conditioning weight
+  ddim_t_start:     350   # SDEdit noising depth (kept < 400 to spare microaneurysm-scale anatomy)
+  max_train_lcw:    0.4   # inference fallback only — training uses the A-LCW gate
 
 eval:
-  vis_every:         1
-  eval_every:        10
-  ddr_eval_every:    10
-  ddr_max_images:    ~    # null = all images
-  ddr_max_seconds:   ~    # null = no time cap
+  vis_every:        1
+  eval_every:       10
+  ddr_eval_every:   5     # over 15 epochs → eval at epoch 4 / 9 / 14
+  ddr_max_images:   ~     # null = full set
+  dice_threshold:   ~     # null = oracle sweep (dev only); set + lock a float before reporting
 ```
 
 ---
@@ -371,47 +382,48 @@ eval:
 
 | Decision | Rationale |
 |----------|-----------|
-| Train on 256px tiles, infer on 512px via MultiDiffusion | UNet fits in VRAM at 256px; MultiDiffusion fuses overlapping tiles for seamless 512px output |
-| `T_start=300` not `T_start=1000` | At t=1000 the image is pure noise — coarse retinal structure (optic disc position, vessel layout) is completely destroyed, forcing the UNet to hallucinate anatomy from scratch. At t=300, the noise is strong enough to erase small lesions (MA, HE) but the UNet can still see the global eye shape through the noise, producing a reconstruction that preserves anatomy while removing pathology. |
-| `block_out_channels: (128, 256, 512, 512)` — cap at 512 | Doubling to 1024 at the bottleneck would quadruple parameter + activation memory, exceeding 24GB VRAM at the target batch size. Repeating 512 instead gives an extra deep reasoning layer at maximum compression depth with no additional memory cost. |
-| Frozen RETFound ViT-Large | RETFound captures fundus-specific anatomy; fine-tuning would destroy the generic healthy-retina prior |
-| Cache raw ViT features, not proj MLP outputs | Proj MLP trains, so caching its output would cause stale gradients across iterations |
-| SNR-γ=2.0 (aggressive) | Paired with LCW: prevents the model from overfitting tile boundary micro-textures at low noise |
-| Frangi on both input green channel AND residual | Green channel catches vascular anatomy; residual Frangi catches vessel-shaped reconstruction artifacts |
-| Element-wise max for multi-scale ensemble | Weighted sum would cap small-scale lesion signal; max lets each scale compete at full confidence |
-| LCW rises with cosine schedule over full training | Prevents tile-specific conditioning from overwhelming global structure conditioning before the UNet learns coarse anatomy |
-| BILINEAR interpolation throughout data pipeline | Avoids bicubic ringing artifacts that contaminate the L1 residual anomaly map |
-| xformers disabled when `torch.compile` is active | Compile + xformers causes attention processor identity checks to thrash the dynamo cache |
+| Train on 256px tiles, infer on **768px** via MultiDiffusion | UNet fits in VRAM at 256px; MultiDiffusion fuses 16 overlapping tiles for a seamless 768px reconstruction. |
+| `T_start=350` not `1000` | At t=1000 the image is pure noise — coarse anatomy (disc, vessel layout) is destroyed and the UNet must hallucinate. At t=350 the noise erases small lesions (MA/HE) while the global eye shape survives, so the reconstruction keeps anatomy and drops pathology. Kept < 400 to spare microaneurysm-scale structure. |
+| `block_out_channels: (128,256,512,512)` — cap at 512 | Doubling to 1024 at the bottleneck quadruples params + activation memory. Repeating 512 adds an extra deep reasoning layer at max compression depth for no extra memory. |
+| Warm-start from a 256px checkpoint (LR ×0.3, warmup 1) | This is a fine-tune, not a scratch run; the 256px `best_loss` is a competent recon base. Lower LR + short warmup anneal cleanly onto the 768px manifold. |
+| Frozen RETFound ViT-Large | RETFound captures fundus-specific anatomy; fine-tuning would destroy the generic healthy-retina prior. |
+| Cache **pre-projection** raw ViT features (on disk) | `proj` trains, so caching its output would freeze a random epoch-0 projection. Caching the raw `[1,1024]` CLS and applying `proj` live keeps the global cond current. |
+| **A-LCW learned gate** (vs fixed cosine LCW) | A per-tile, per-step MLP gate learns the local/global conditioning mix instead of a hand-tuned schedule — each tile/timestep decides how much to trust local detail. |
+| Per-tile **sequential backward** (phase-2) | Forward+backward one tile at a time frees activations between tiles → peak VRAM = a single tile, independent of tile count. Enables 768px on 40GB. |
+| `sqrt`-frequency domain sampler | Corrects the 90%-head domain imbalance without over-boosting tiny domains (PALM = 161 out of 67,318). |
+| SNR-γ=2.0 (aggressive) | Balances against the L1/FFL term at low noise; prevents overfitting tile-boundary micro-textures. |
+| Residual-Frangi **gated by a real-vessel band** | Suppresses vessel-shaped artifacts only where they coincide with anatomy — ridge-shaped residual away from vessels (flame haemorrhages, NVD/NVE) survives as lesion. |
+| Element-wise **max** for the multi-scale ensemble | Weighted sum caps small-scale lesion signal; max lets each scale compete at full confidence. |
+| **BILINEAR** interpolation throughout | Avoids bicubic ringing that contaminates the L1 residual. |
+| `compile` off, xformers on | reduce-overhead cudagraphs collide with the xformers `flash_bwd` custom op under per-tile sequential backward; xformers alone gives most of the attention speedup. |
 
 ---
 
 ## 6. Diffusion Training Pipeline
 
-### Tensor Flow & LCW (Line-by-Line Highlights)
+### Tensor Flow & A-LCW (Highlights)
 
-- **Data:** (B, 3, 512, 512) pixels in [-1,1].
-- **Batched ViT (O1):** 2 random (256, 256) tiles are extracted, batched together to (B*2, 3, 256, 256), and passed through RETFound once (	rain.py:402-406) to save 50% compute.
-- **Mask:** Computed once per image (B, 1, 512, 512), sliced per tile.
-- **Conditioning Blend:** lended = LCW * local_cond + (1-LCW) * global_cond.
-- **LCW Warmup:** The LCW dynamically rises via a cosine schedule (	rain.py:421-423) across the training run so the UNet learns global anatomy before focusing on tile-level detail.
+- **Data:** `(B, 3, 768, 768)` pixels in `[-1,1]`.
+- **Random tiles:** `NUM_TRAIN_TILES=2` random `(256,256)` tile views/step, batched through RETFound **once** (no-grad) for all tiles.
+- **Mask:** circular FOV mask computed once per image `(B,1,768,768)`, sliced per tile.
+- **Per-tile proj + gate (live):** `proj` is applied per tile (independent graph) -> `local_cond`; the **A-LCW gate** predicts `lcw` and blends `blended = lcw*local + (1-lcw)*global` (global detached).
+- **Sequential backward:** each tile's UNet forward -> loss -> backward immediately, freeing activations before the next tile.
 
 ```
 Epoch start
 |
-├── [cosine over full run] LCW schedule → LCW value for this step
-|
 ├── For each batch:
-|   ├── Sample NUM_TRAIN_TILES=2 random tile views
-|   ├── CachedConditioner → ViT features (LRU cached per path)
-|   ├── add_simplex_noise → x_t at random t ∈ [0, 1000]
-|   ├── autocast forward → pred_noise
-|   ├── diffusion_loss (0.6 × SNR-weighted + 0.4 × FFL hybrid)
-|   ├── GradScaler backward
-|   └── every ACCUM_STEPS: clip_grad_norm(1.0) → optimizer.step()
+|   ├── Sample NUM_TRAIN_TILES=2 random tile views (of 16)
+|   ├── Disk/LRU cache → raw [1,1024] ViT features (proj applied live)
+|   ├── add_simplex_noise (Gaussian) → x_t at random t ∈ [0, 1000]
+|   ├── Phase 1: per-tile proj + A-LCW gate → blended_cond
+|   ├── Phase 2 (per tile): autocast UNet → pred_noise
+|   │            └ diffusion_loss (0.6·Min-SNR MSE + 0.4·(L1+FFL)) → backward
+|   └── every ACCUM_STEPS: clip_grad_norm(1.0) → optimizer.step() → EMA update
 |
-├── [every VIS_EVERY epochs] save_visualizations
-├── [every EVAL_EVERY epochs] compute_val_metrics (SSIM/PSNR)
-├── [every DDR_EVAL_EVERY epochs] compute_ddr_metrics → DDR AUROC
+├── [every VIS_EVERY epochs]      save_visualizations
+├── [every EVAL_EVERY epochs]     compute_val_metrics (SSIM/PSNR)
+├── [every DDR_EVAL_EVERY epochs] compute_ddr_metrics → DDR/iDRiD AUROC (OOM-guarded)
 |
 └── Save: last.pt, best_loss.pt, best_auroc.pt, CSVs, dashboard
 ```
@@ -421,25 +433,26 @@ Epoch start
 ## 7. Diffusion Inference Pipeline
 
 ```
-Input: 512×512 fundus image
+Input: 768×768 fundus image
 
-1. CachedConditioner.get_full_image_cond()    →  global_cond (1,1,768)
-2. CachedConditioner.get_tile_conds_batched() →  9× local_cond (1,1,768)
-3. add_simplex_noise(img, T_start=300)        →  x_T
+1. get_full_image_cond()              →  global_cond (1,1,768)
+2. get_tile_conds_batched()           →  16× local_cond (1,1,768)
+3. add_simplex_noise(img, T_start=350) →  x_T
 4. DDIM loop (50 steps):
-   For each of 9 tiles:
-     tile_cond = LCW(t) × local_cond + (1 - LCW(t)) × global_cond
-     pred_noise = UNet(tile, t, tile_cond)
+   For each of 16 tiles:
+     lcw       = LCWGate(global_cond, local_cond, t_ratio)   # learned, per tile/step
+     tile_cond = lcw × local_cond + (1 - lcw) × global_cond
+     pred_noise    = UNet(tile, t, tile_cond)
      tile_denoised = DDIM_step(tile, pred_noise)
-     accumulate: value[h0:h1, w0:w1] += tile_denoised × pyramid_weight
+     accumulate: value[h0:h1, w0:w1] += tile_denoised × cosine²_weight
    x_t = value / count
-5. recon_512 = x_T (final)
-6. residual = |img - recon_512|.mean(channel) × retinal_mask
+5. recon_768 = x_0 (final)
+6. residual = |img - recon_768|.mean(channel) × circular_mask
 7. postprocess_residual():
    - Median subtract → Gaussian blur
-   - Frangi(green channel) + Frangi(residual) → vessel map
-   - anomaly_map = residual × exp(-1.5 × vessel_norm)
-8. Output: anomaly_map ∈ [0,1], pixel-level
+   - Frangi(green) + vessel-band-gated Frangi(residual) → vessel map
+   - residual × exp(-1.5 × vessel_norm) → per-image MAD-z
+8. Output: pixel-level anomaly map (MAD-z scored)
 ```
 
 The anomaly map is then saved and used as input to the Classifier pipeline.
@@ -448,10 +461,12 @@ The anomaly map is then saved and used as input to the Classifier pipeline.
 
 ## 8. Evaluation
 
+Both eval sets are **held out** — never seen during training. Scoring uses the vessel-suppressed, per-image **MAD-z** anomaly map (`postprocess_residual`).
+
 ### DDR Dataset
 - 757 labeled fundus images with pixel-level annotations: **MA** (Microaneurysms), **HE** (Hemorrhages), **EX** (Hard Exudates), **SE** (Soft Exudates).
 - Masks combined into a single binary map (logical OR across lesion types).
-- Pixel-level metrics: **AUROC** (primary), **AP**, **Dice** (best threshold via sweep).
+- Pixel-level metrics: **AUROC** (primary), **AP**, **Dice** (threshold from a locked val sweep; the oracle sweep is dev-only and must not be reported).
 - Required structure: `ddr_masks_dir/{MA,HE,EX,SE}/{stem}.tif`
 
 ### iDRiD Dataset
@@ -478,6 +493,8 @@ All checkpoints saved to `checkpoint_dir`:
 | `metrics_dashboard.png` | 4-panel metrics history figure |
 | `recon_epoch_XXXX.png` | Per-epoch reconstruction panels |
 | `anomaly_maps/` | Per-image dark-theme overlay panels |
+
+> **Model selection:** pick **`best_auroc.pt`** for deployment, not `best_loss.pt`. Reconstruction-UAD *detection* peaks (epoch ~8–15) **before** reconstruction loss fully converges; past the peak the model over-reconstructs lesions and detection drops. `best_auroc.pt` captures that peak (evaluated at the DDR-eval epochs).
 
 ---
 
@@ -511,19 +528,24 @@ shap               # Feature importance analysis
 ## 11. Usage — Diffusion
 
 ```bash
-# Train
-python -m diffusion.train --config diffusion/config.yaml
+# 0. One-time: carve a 5% healthy val hold-out from the train CSV
+python carve_val.py
 
-# With persistent logging in a detached session
-python -m diffusion.train --config diffusion/config.yaml 2>&1 | tee -a checkpoints/train.log
+# 1. One-time: pre-compute the RETFound feature cache (pre-projection [1,1024])
+python cache_features.py --config config.yaml
 
-# Sweep mode (set sweep.enabled: true in config)
-python -m diffusion.train --config diffusion/config.yaml
+# 2. Train
+python train.py --config config.yaml
+
+# With persistent logging
+python train.py --config config.yaml 2>&1 | tee -a checkpoints_768v5/train.log
 ```
 
-**Resume:** Training auto-resumes from `last.pt` if it exists in `checkpoint_dir`. No flag needed.
+**Resume:** training auto-resumes from `last.pt` if it exists in `checkpoint_dir`. No flag needed.
 
-**Warm-start from 256px checkpoint:** Set `paths.pretrained_256` to your 256px `last.pt`. LR is automatically scaled to 30% base and warmup reduced to 1 epoch.
+**Warm-start from a 256px checkpoint:** set `paths.pretrained_256` to a 256px `best_loss.pt`. Base LR is scaled to 30% and warmup forced to 1 epoch automatically.
+
+**Model selection:** pick **`best_auroc.pt`** for deployment — reconstruction-UAD *detection* peaks (epoch ~8–15) **before** reconstruction loss converges; `best_loss.pt` over-reconstructs lesions and detection drops.
 
 ---
 ---
